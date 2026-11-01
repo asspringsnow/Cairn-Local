@@ -70,6 +70,8 @@ Cairn 不再依赖任何外部 agent CLI，也不再需要 Docker：
 
 每个项目在 `runtime.workspace_root` 下有一个独立工作目录，agent 的 cwd、session、工具输出都在里面。Dispatcher 仍然是唯一协议写入者，agent 不直接调用 Cairn API。
 
+完整使用文档见 [docs/usage.md](docs/usage.md)。
+
 ## 快速开始（Linux / Kali）
 
 要求：
