@@ -95,7 +95,17 @@ stop_one() {
   echo "[+] 已停止 $name (pid $pid)"
 }
 
+sync_config_port() {
+  if [ ! -f "$CONFIG" ] || ! command -v sed >/dev/null 2>&1; then
+    return 0
+  fi
+  # Keep a previously generated dispatch.yaml in step with the port the user
+  # actually starts the server on (8000 by default, or CAIRN_PORT override).
+  sed -i -E "s#^(server:[[:space:]]*)\"?http://127\\.0\\.0\\.1:[0-9]+\"?[[:space:]]*\$#\\1\"http://127.0.0.1:${PORT}\"#" "$CONFIG"
+}
+
 cmd_start() {
+  sync_config_port
   if ! command -v uv >/dev/null 2>&1; then
     echo "[!] 找不到 uv，先运行 bash scripts/setup.sh"
     exit 1
