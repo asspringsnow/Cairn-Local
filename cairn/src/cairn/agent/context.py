@@ -15,9 +15,13 @@ from cairn.agent.messages import Message, message_text_for_estimate, system_mess
 from cairn.agent.providers import BaseClient
 from cairn.agent.settings import AgentSettings
 
-COMPACT_RESERVE_TOKENS = 16384
 COMPACT_KEEP_RECENT_TOKENS = 20000
 SUMMARY_MAX_CHARS = 40_000
+
+
+def compact_trigger_tokens(settings: AgentSettings) -> int:
+    """Compact when the transcript reaches 80% of the model context window."""
+    return max(1, int(settings.context_window * 0.8))
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -39,8 +43,7 @@ def estimate_messages_tokens(messages: list[Message]) -> int:
 def should_compact(messages: list[Message], settings: AgentSettings, *, last_prompt_tokens: int = 0) -> bool:
     estimated = estimate_messages_tokens(messages)
     tokens = max(estimated, last_prompt_tokens)
-    reserve = min(COMPACT_RESERVE_TOKENS, max(1024, settings.context_window // 16))
-    return tokens > settings.context_window - reserve
+    return tokens > compact_trigger_tokens(settings)
 
 
 def _segments(messages: list[Message]) -> list[list[Message]]:
@@ -198,7 +201,7 @@ def compact_messages(
 
     # Hard fallback: if the summary itself was huge or keep still exceeds the
     # budget, drop the oldest kept segments (never the last one).
-    trigger_tokens = settings.context_window - min(COMPACT_RESERVE_TOKENS, max(1024, settings.context_window // 16))
+    trigger_tokens = compact_trigger_tokens(settings)
     while estimate_messages_tokens(compacted) > trigger_tokens and len(keep) > 1:
         keep.pop(0)
         compacted = [*system]

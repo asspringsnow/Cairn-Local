@@ -4,7 +4,7 @@ import json
 import threading
 import time
 
-from cairn.agent.context import estimate_messages_tokens, should_compact
+from cairn.agent.context import compact_trigger_tokens, estimate_messages_tokens, should_compact
 from cairn.agent.messages import assistant_message, system_message, tool_message, to_anthropic, to_openai, user_message
 from cairn.agent.providers import AnthropicClient, OpenAIClient, anthropic_url, openai_url, parse_anthropic_sse, parse_openai_sse
 from cairn.agent.loop import AgentLoop
@@ -162,6 +162,9 @@ def test_anthropic_stream_parses_text_tool_input_and_usage() -> None:
 def test_usage_based_compaction_trigger_and_parallel_tool_flags(tmp_path) -> None:
     settings = AgentSettings(api_key="x", model="m", base_url="http://x", context_window=100000)
     messages = [user_message("small")]
+    assert compact_trigger_tokens(settings) == 80000
+    assert not should_compact(messages, settings, last_prompt_tokens=79000)
+    assert should_compact(messages, settings, last_prompt_tokens=81000)
     assert not should_compact(messages, settings, last_prompt_tokens=1000)
     assert should_compact(messages, settings, last_prompt_tokens=99000)
 
