@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 from cairn.agent.context import estimate_messages_tokens, should_compact
 from cairn.agent.messages import assistant_message, system_message, tool_message, to_anthropic, to_openai, user_message
-from cairn.agent.providers import anthropic_url, openai_url, parse_anthropic_sse, parse_openai_sse
+from cairn.agent.providers import AnthropicClient, OpenAIClient, anthropic_url, openai_url, parse_anthropic_sse, parse_openai_sse
+from cairn.agent.loop import AgentLoop
 from cairn.agent.session import SessionState, SessionStore
 from cairn.agent.settings import AgentSettings
 from cairn.agent.tools import Toolbox
@@ -170,3 +173,75 @@ def test_usage_based_compaction_trigger_and_parallel_tool_flags(tmp_path) -> Non
     assert not toolbox.is_parallel_safe("bash")
     assert not toolbox.is_parallel_safe("write")
     assert not toolbox.is_parallel_safe("edit")
+
+
+class _JsonResponse:
+    headers = {"content-type": "application/json"}
+
+    def json(self):
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "non-sse fallback"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 2},
+        }
+
+    def close(self) -> None:
+        return None
+
+
+def test_streaming_client_accepts_200_non_sse_gateway(monkeypatch) -> None:
+    client = OpenAIClient(AgentSettings(api_key="x", model="m", base_url="http://x"))
+    monkeypatch.setattr(client, "_open_stream", lambda *_args, **_kwargs: _JsonResponse())
+    response = client.chat([{"role": "user", "content": "hi"}], [], stream=True)
+    assert response.text == "non-sse fallback"
+    assert response.usage["prompt_tokens"] == 7
+
+
+class _AnthropicJsonResponse:
+    headers = {"content-type": "application/json"}
+
+    def json(self):
+        return {
+            "content": [{"type": "text", "text": "anthropic non-sse fallback"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+        }
+
+    def close(self) -> None:
+        return None
+
+
+def test_anthropic_streaming_client_accepts_200_non_sse_gateway(monkeypatch) -> None:
+    client = AnthropicClient(AgentSettings(provider="anthropic", api_key="x", model="m", base_url="http://x"))
+    monkeypatch.setattr(client, "_open_stream", lambda *_args, **_kwargs: _AnthropicJsonResponse())
+    response = client.chat([{"role": "user", "content": "hi"}], [], stream=True)
+    assert response.text == "anthropic non-sse fallback"
+    assert response.usage["prompt_tokens"] == 3
+
+
+def test_sequential_tool_timeout_backfills_tool_results(tmp_path) -> None:
+    settings = AgentSettings(api_key="x", model="m", base_url="http://x")
+    session = SessionState("sys")
+    loop = AgentLoop(
+        settings,
+        object(),
+        Toolbox(tmp_path),
+        session,
+        SessionStore(tmp_path / "session.json"),
+        lambda _event: None,
+        threading.Event(),
+    )
+    calls = [
+        {"id": "c1", "name": "write", "arguments": {"path": "a.txt", "content": "a"}},
+        {"id": "c2", "name": "write", "arguments": {"path": "b.txt", "content": "b"}},
+    ]
+
+    loop._execute_tool_calls(calls, time.monotonic() - 1)
+
+    results = [message for message in session.messages if message.get("role") == "tool"]
+    assert [message["tool_call_id"] for message in results] == ["c1", "c2"]
+    assert all(message["is_error"] for message in results)

@@ -393,6 +393,16 @@ class OpenAIClient(BaseClient):
             try:
                 response = self._open_stream(url, headers, payload, timeout_value, retries=retries)
                 try:
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "text/event-stream" not in content_type:
+                        # Some gateways return a normal JSON body despite
+                        # stream=true. Try it first; if the body is actually
+                        # SSE with a missing header, json() raises and we fall
+                        # through to the SSE parser below.
+                        try:
+                            return self._parse_non_stream(response.json())
+                        except (ValueError, KeyError, TypeError):
+                            pass
                     return parse_openai_sse(_iter_sse_data(response))
                 finally:
                     response.close()
@@ -403,7 +413,11 @@ class OpenAIClient(BaseClient):
                     raise
                 payload.pop("stream_options", None)
                 payload["stream"] = False
-        data = self._post(url, headers, payload, timeout_value, retries=retries)
+        request_timeout = max(5, timeout_value // 2) if stream else timeout_value
+        return self._parse_non_stream(self._post(url, headers, payload, request_timeout, retries=retries))
+
+    @staticmethod
+    def _parse_non_stream(data: dict[str, Any]) -> ModelResponse:
         try:
             choice = data["choices"][0]
             message = choice["message"]
@@ -472,6 +486,14 @@ class AnthropicClient(BaseClient):
             try:
                 response = self._open_stream(url, headers, payload, timeout_value, retries=retries)
                 try:
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "text/event-stream" not in content_type:
+                        # Anthropic-compatible gateways may ignore stream=true
+                        # and return a plain JSON message instead.
+                        try:
+                            return self._parse_non_stream(response.json())
+                        except (ValueError, KeyError, TypeError):
+                            pass
                     return parse_anthropic_sse(_iter_sse_data(response))
                 finally:
                     response.close()
@@ -479,7 +501,11 @@ class AnthropicClient(BaseClient):
                 if isinstance(exc, ModelError) and (exc.context_overflow or exc.status_code in (401, 403)):
                     raise
                 payload["stream"] = False
-        data = self._post(url, headers, payload, timeout_value, retries=retries)
+        request_timeout = max(5, timeout_value // 2) if stream else timeout_value
+        return self._parse_non_stream(self._post(url, headers, payload, request_timeout, retries=retries))
+
+    @staticmethod
+    def _parse_non_stream(data: dict[str, Any]) -> ModelResponse:
         blocks = data.get("content")
         if not isinstance(blocks, list):
             raise ModelError(f"unexpected Anthropic response: {str(data)[:1000]}")
