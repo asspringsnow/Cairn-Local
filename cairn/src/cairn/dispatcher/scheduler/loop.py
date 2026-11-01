@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import shutil
-import subprocess
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -10,15 +8,13 @@ from pathlib import Path
 
 import requests
 
-from cairn.dispatcher.config import DispatchConfig, LocalConfig, WorkerConfig
+from cairn.agent.settings import AgentSettings
+from cairn.dispatcher.config import DispatchConfig, WorkerConfig
 from cairn.dispatcher.models import ReasonCheckpoint, RunningTask
 from cairn.dispatcher.protocol.client import CairnClient
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
-from cairn.dispatcher.runtime.containers import ContainerManager
-from cairn.dispatcher.runtime.local_backend import LocalBackend
-from cairn.dispatcher.runtime.startup_healthcheck import format_failure_summary, run_startup_healthchecks
+from cairn.dispatcher.runtime.workspace import WorkspaceManager
 from cairn.dispatcher.scheduler.worker_select import choose_worker
-from cairn.dispatcher.workers.registry import get_driver
 from cairn.dispatcher.tasks.bootstrap import run_bootstrap_task
 from cairn.dispatcher.tasks.explore import run_explore_task
 from cairn.dispatcher.tasks.reason import run_reason_task
@@ -45,11 +41,11 @@ class DispatcherLoop:
         self.config_path = config_path
         self.config = DispatchConfig.load(config_path)
         self.client = CairnClient(self.config.server)
-        if self.config.runtime.execution == "local":
-            self.container_manager = LocalBackend(self.config.local or LocalConfig())
-        else:
-            assert self.config.container is not None
-            self.container_manager = ContainerManager(self.config.container)
+        self.workspace = WorkspaceManager(
+            self.config.workspace_root,
+            completed_action=self.config.runtime.completed_action,
+        )
+        self.agent_settings: AgentSettings | None = None
         self.executor = ThreadPoolExecutor(max_workers=self.config.runtime.max_workers)
         self.cleanup_executor = ThreadPoolExecutor(max_workers=max(1, min(8, self.config.runtime.max_workers)))
         self.futures: dict[Future[str], RunningTask] = {}
@@ -64,6 +60,7 @@ class DispatcherLoop:
         self.project_cursor = 0
         self._settings_checked = False
         self._startup_healthchecks_checked = False
+        self._agent_settings_signature: tuple[object, ...] | None = None
 
     def close(self) -> None:
         if self.futures:
@@ -74,7 +71,7 @@ class DispatcherLoop:
             )
         self.executor.shutdown(wait=True)
         self.cleanup_executor.shutdown(wait=True)
-        self.container_manager.close()
+        self.workspace.close()
         self.client.close()
 
     def run(self, once: bool = False) -> None:
@@ -87,11 +84,12 @@ class DispatcherLoop:
                         self._settings_checked = True
                     self._reap_futures()
                     self._reap_cleanup_futures()
+                    self._refresh_agent_settings()
                     summaries = self.client.list_projects()
                     self._initialize_reason_checkpoints(summaries)
                     self._refresh_runtime_projects(summaries)
                     self._cancel_inactive_tasks(summaries)
-                    self._queue_container_cleanups(summaries)
+                    self._queue_workspace_cleanups(summaries)
                     self._dispatch_available(summaries)
                 except requests.RequestException as exc:
                     if once:
@@ -115,80 +113,120 @@ class DispatcherLoop:
         finally:
             self.close()
 
+    def _requires_native_worker(self) -> bool:
+        return any(worker.type == "native" for worker in self.config.workers)
+
     def run_startup_healthchecks(self, *, show_commands: bool = False, force: bool = False) -> None:
         if self._startup_healthchecks_checked:
             return
-        if self.config.runtime.execution == "local":
-            self._run_local_binary_check()
+        if not self._requires_native_worker():
+            LOG.info("skip model healthcheck because configured workers are mock-only")
             self._startup_healthchecks_checked = True
             return
+        try:
+            settings = self.client.get_agent_settings()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 403:
+                message = (
+                    "server rejected /settings/agent (403); the dispatcher must connect through a loopback "
+                    "server URL such as http://127.0.0.1:<port>, or run on the server host"
+                )
+            else:
+                message = f"cannot load agent model settings from server: {exc}"
+            if force:
+                raise RuntimeError(message) from exc
+            LOG.error("%s; open the Web UI and configure the model", message)
+            self._startup_healthchecks_checked = True
+            return
+        except Exception as exc:
+            message = f"cannot load agent model settings from server: {exc}"
+            if force:
+                raise RuntimeError(message) from exc
+            LOG.error("%s; open the Web UI and configure the model", message)
+            self._startup_healthchecks_checked = True
+            return
+        if not settings.configured:
+            self.agent_settings = None
+            self._agent_settings_signature = None
+            message = "agent model is not configured; open the Web UI -> Server Settings and set Base URL, Model and API Key"
+            if force:
+                raise RuntimeError(message)
+            LOG.error(message)
+            self._startup_healthchecks_checked = True
+            return
+        self.agent_settings = settings
+        self._agent_settings_signature = self._signature(settings)
         if not force and self.config.runtime.worker_healthcheck == "disabled":
-            LOG.info("skip startup worker healthchecks because runtime.worker_healthcheck=disabled")
+            LOG.info("skip startup model healthcheck because runtime.worker_healthcheck=disabled")
             self._startup_healthchecks_checked = True
             return
-        self._run_startup_healthchecks(show_commands=show_commands)
+        LOG.info(
+            "checking agent model provider=%s model=%s base_url=%s",
+            settings.provider,
+            settings.model,
+            settings.base_url,
+        )
+        response = self.client.test_agent_settings()
+        if not response.ok:
+            detail = response.data.get("detail") if isinstance(response.data, dict) else response.text
+            message = f"agent model healthcheck failed status={response.status_code} detail={detail}"
+            if force:
+                raise RuntimeError(message)
+            LOG.error(message)
+        else:
+            LOG.info("agent model healthcheck ok model=%s", settings.model)
         self._startup_healthchecks_checked = True
 
-    def _run_local_binary_check(self) -> None:
-        binaries: dict[str, list[str]] = {}
-        for worker in self.config.workers:
-            binary = get_driver(worker.type, "local").local_binary()
-            if binary is None:
-                continue
-            binaries.setdefault(binary, []).append(worker.name)
-        if not binaries:
-            return
-
-        LOG.info("[*] Local execution: checking %d worker CLI(s) on this host", len(binaries))
-        available: list[str] = []
-        missing: list[str] = []
-        for binary in sorted(binaries):
-            workers = ", ".join(sorted(binaries[binary]))
-            path, runnable = self._probe_local_cli(binary)
-            if path is None:
-                missing.append(binary)
-                LOG.error("[-] %-8s not found on PATH (workers: %s)", binary, workers)
-            elif runnable:
-                available.append(binary)
-                LOG.info("[+] %-8s %s (workers: %s)", binary, path, workers)
-            else:
-                available.append(binary)
-                LOG.warning("[!] %-8s %s found but `%s --help` failed (workers: %s)", binary, path, binary, workers)
-
-        if not available:
-            raise RuntimeError(
-                "local execution: none of the configured worker CLIs are installed on PATH ("
-                + ", ".join(sorted(binaries))
-                + "). Install them and make sure each runs directly from your shell, then retry."
-            )
-        if missing:
-            LOG.warning(
-                "[!] Missing CLIs, their workers cannot run: %s. Install them or drop those workers.",
-                ", ".join(sorted(missing)),
-            )
-        LOG.warning(
-            "[!] Local mode uses each CLI's own host config: make sure %s already logged in / "
-            "configured and usable directly (e.g. `claude -p ...` works) — Cairn injects no API keys.",
-            ", ".join(sorted(available)),
-        )
-
     @staticmethod
-    def _probe_local_cli(binary: str) -> tuple[str | None, bool]:
-        path = shutil.which(binary)
-        if path is None:
-            return None, False
+    def _signature(settings: AgentSettings) -> tuple[object, ...]:
+        return (settings.provider, settings.base_url, settings.model, bool(settings.api_key))
+
+    def _refresh_agent_settings(self) -> None:
         try:
-            result = subprocess.run(
-                [binary, "--help"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
+            settings = self.client.get_agent_settings()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 403:
+                self._log_changed(
+                    "dispatch/model-auth",
+                    logging.ERROR,
+                    "server rejected /settings/agent (403): dispatcher must use a loopback server URL "
+                    "such as http://127.0.0.1:<port>, or run on the server host",
+                )
+                self.agent_settings = None
+                self._agent_settings_signature = None
+                return
+            raise
+        if not settings.configured:
+            if self.agent_settings is not None:
+                LOG.error("agent model configuration was cleared; dispatch is paused until it is set again")
+            self.agent_settings = None
+            self._agent_settings_signature = None
+            return
+        signature = self._signature(settings)
+        if signature != self._agent_settings_signature:
+            LOG.info(
+                "agent model configured provider=%s model=%s base_url=%s context_window=%s",
+                settings.provider,
+                settings.model,
+                settings.base_url,
+                settings.context_window,
             )
-        except (OSError, subprocess.SubprocessError):
-            return path, False
-        return path, result.returncode == 0
+            self.agent_settings = settings
+            self._agent_settings_signature = signature
 
     def _dispatch_available(self, summaries: list[ProjectSummary]) -> None:
+        if self.agent_settings is None:
+            if self._requires_native_worker():
+                self._log_changed(
+                    "dispatch/model",
+                    logging.WARNING,
+                    "skip dispatch because the agent model is not configured (Web UI -> Server Settings)",
+                )
+                return
+            # Mock-only configurations do not need a model.
+            self.agent_settings = AgentSettings()
         if len(self.futures) >= self.config.runtime.max_workers:
             self._log_changed(
                 "dispatch/global",
@@ -253,12 +291,12 @@ class DispatcherLoop:
 
     def _try_dispatch_project(self, summary: ProjectSummary) -> bool:
         skip_scope = f"project:{summary.id}:skip"
-        container_name = self.container_manager.container_name(summary.id)
+        container_name = self.workspace.container_name(summary.id)
         if container_name in self._cleanup_pending:
             self._log_changed(
                 f"{skip_scope}:cleanup_pending",
                 logging.DEBUG,
-                "skip project=%s because container cleanup is still pending container=%s",
+                "skip project=%s because workspace cleanup is still pending path=%s",
                 summary.id,
                 container_name,
             )
@@ -402,7 +440,8 @@ class DispatcherLoop:
                 run_reason_task,
                 self.config,
                 self.client,
-                self.container_manager,
+                self.workspace,
+                self.agent_settings,
                 project,
                 export_yaml,
                 worker,
@@ -469,7 +508,8 @@ class DispatcherLoop:
                 run_bootstrap_task,
                 self.config,
                 self.client,
-                self.container_manager,
+                self.workspace,
+                self.agent_settings,
                 project,
                 intent,
                 worker,
@@ -527,7 +567,8 @@ class DispatcherLoop:
                 run_explore_task,
                 self.config,
                 self.client,
-                self.container_manager,
+                self.workspace,
+                self.agent_settings,
                 project,
                 export_yaml,
                 intent,
@@ -781,41 +822,41 @@ class DispatcherLoop:
             except Exception:
                 LOG.exception("task crashed project=%s task=%s worker=%s", task.project_id, task.task_type, task.worker_name)
 
-    def _cleanup_completed_containers(self, summaries: list[ProjectSummary]) -> None:
+    def _cleanup_completed_workspaces(self, summaries: list[ProjectSummary]) -> None:
         for summary in summaries:
             if summary.status != "completed":
                 continue
             if self._inactive_cleanup_done.get(summary.id) == summary.status:
                 continue
-            container_name = self.container_manager.container_name(summary.id)
-            if container_name in self._cleanup_pending:
+            workspace_name = self.workspace.container_name(summary.id)
+            if workspace_name in self._cleanup_pending:
                 continue
-            if not self.container_manager.needs_completed_cleanup(summary.id):
+            if not self.workspace.needs_completed_cleanup(summary.id):
                 self._inactive_cleanup_done[summary.id] = summary.status
                 continue
-            future = self.cleanup_executor.submit(self.container_manager.cleanup_completed, summary.id)
-            self.cleanup_futures[future] = (container_name, summary.id, summary.status)
-            self._cleanup_pending.add(container_name)
+            future = self.cleanup_executor.submit(self.workspace.cleanup_completed, summary.id)
+            self.cleanup_futures[future] = (workspace_name, summary.id, summary.status)
+            self._cleanup_pending.add(workspace_name)
 
-    def _cleanup_stopped_containers(self, summaries: list[ProjectSummary]) -> None:
+    def _cleanup_stopped_workspaces(self, summaries: list[ProjectSummary]) -> None:
         for summary in summaries:
             if summary.status != "stopped":
                 continue
             if self._inactive_cleanup_done.get(summary.id) == summary.status:
                 continue
-            container_name = self.container_manager.container_name(summary.id)
-            if container_name in self._cleanup_pending:
+            workspace_name = self.workspace.container_name(summary.id)
+            if workspace_name in self._cleanup_pending:
                 continue
-            if not self.container_manager.needs_stopped_cleanup(summary.id):
+            if not self.workspace.needs_stopped_cleanup(summary.id):
                 self._inactive_cleanup_done[summary.id] = summary.status
                 continue
-            future = self.cleanup_executor.submit(self.container_manager.cleanup_stopped, summary.id)
-            self.cleanup_futures[future] = (container_name, summary.id, summary.status)
-            self._cleanup_pending.add(container_name)
+            future = self.cleanup_executor.submit(self.workspace.cleanup_stopped, summary.id)
+            self.cleanup_futures[future] = (workspace_name, summary.id, summary.status)
+            self._cleanup_pending.add(workspace_name)
 
-    def _queue_container_cleanups(self, summaries: list[ProjectSummary]) -> None:
-        self._cleanup_completed_containers(summaries)
-        self._cleanup_stopped_containers(summaries)
+    def _queue_workspace_cleanups(self, summaries: list[ProjectSummary]) -> None:
+        self._cleanup_completed_workspaces(summaries)
+        self._cleanup_stopped_workspaces(summaries)
 
     def _reap_cleanup_futures(self) -> None:
         done = [future for future in self.cleanup_futures if future.done()]
@@ -831,7 +872,7 @@ class DispatcherLoop:
             except Exception:
                 if project_id is not None:
                     self._inactive_cleanup_done.pop(project_id, None)
-                LOG.exception("container cleanup failed container=%s", name)
+                LOG.exception("workspace cleanup failed path=%s", name)
 
     def _refresh_runtime_projects(self, summaries: list[ProjectSummary]) -> None:
         active_ids = {summary.id for summary in summaries if summary.status == "active"}
@@ -927,9 +968,3 @@ class DispatcherLoop:
                 value,
                 interval,
             )
-
-    def _run_startup_healthchecks(self, *, show_commands: bool) -> None:
-        results = run_startup_healthchecks(self.config, show_commands=show_commands)
-        if any(result.ok for result in results):
-            return
-        raise RuntimeError(format_failure_summary(results))

@@ -3,222 +3,201 @@
 <img src="./README/banner.png" alt="Cairn Banner"/>
 
 # Cairn
-### More Than Just AI Penetration Testing — Towards General State-Space Search
 
-<p>
-  <a href="https://zc.tencent.com/hackathon" target="_blank" rel="noopener noreferrer">
-    <img src="./README/tencent.png" alt="Tencent" height="55" />
-  </a>
-  <a href="https://zc.tencent.com/hackathon" target="_blank" rel="noopener noreferrer">
-    <img src="./README/tch.png" alt="TCH" height="55" />
-  </a>
-  <a href="https://wiki.chainreactors.red" target="_blank" rel="noopener noreferrer">
-    <img src="./README/c.png" alt="ChainReactors" height="45" />
-  </a>
-</p>
-
-Cairn is a general-purpose problem-solving engine. <br/>It defines no roles, no workflows. Given an origin and a goal, it searches for a path through an unknown state space. <br/>AI Penetration Testing is one such problem — and a proven one.
-
-<p>
-  <a href="https://discord.gg/nDSy4NZVP" target="_blank" rel="noopener noreferrer">
-    <img src="https://img.shields.io/badge/Discord-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord" />
-  </a>
-  <a href="https://x.com/le1xia0" target="_blank" rel="noopener noreferrer">
-    <img src="https://img.shields.io/badge/X-000000?style=flat-square&logo=x&logoColor=white" alt="X" />
-  </a>
-</p>
+### 从 AI 渗透测试出发的通用状态空间搜索
 
 </div>
 
-<p align="center">
-  <a href="https://www.bilibili.com/video/BV1a8R5BhEVi/" target="_blank" rel="noopener noreferrer">
-    <img src="./README/cairn.png" alt="Cairn runtime screenshot" width="900" />
-  </a>
-</p>
+Cairn 是一个面向“已知起点、已知目标、未知路径”问题的探索引擎。渗透测试、CTF、漏洞研究、甚至数学证明，都可以看成同一个形状：从已知事实出发，不断探索，直到某些事实共同满足目标。
 
-## What is Cairn?
+Cairn 用 **Fact / Intent / Hint** 构成的图来记录整个探索过程：
 
-Penetration testing is fundamentally a **directed search through a near-infinite state space**:
+| 概念 | 含义 |
+|------|------|
+| **Fact** | 已确认的客观事实，写入图中，只增不改 |
+| **Intent** | 一个已声明的探索方向，尚未得出结论 |
+| **Hint** | 人随时注入的判断、方向或补充信息 |
 
-- **Origin**: known (target IP, target system)
-- **Goal**: defined (get a shell, capture the flag)
-- **Path**: unknown
+图从 `origin` 生长到 `goal`。每个 Fact 是一块垫脚石，每个 Intent 是向未知迈出的一步。多个 agent 并发读写同一张图，通过共享环境间接协作（stigmergy），不需要互相直接通信。
 
-This structure is not unique to penetration testing. Vulnerability research, mathematical proof, CTF challenges — any problem with a clear starting point, a clear success condition, and an unknown path in between shares the same shape.
+## 这一版的变化
 
-Cairn is built for this class of problems. Penetration testing is the first domain it has been validated on.
+Cairn 不再依赖任何外部 agent CLI，也不再需要 Docker：
 
-The engine is built on a **Blackboard Architecture** with an explicit fact-intent graph. Three primitives are all it needs:
+- **内置 agent**：Cairn 自己实现 LLM 工具循环（OpenAI 兼容 / Anthropic `/v1/messages`）
+- **独立进程**：每个任务启动一个 `cairn.agent.worker` 子进程，不占用 dispatcher 的线程/GIL，超时和项目停止时直接杀进程组
+- **模型配置在 UI**：Base URL、模型名、API Key、上下文长度、温度都可直接在 Web UI 配置，改完下一轮任务自动生效
+- **不再需要** `pi` / `claude` / `codex`
+- **不再有** worker 容器、docker-compose、容器运行时代码
+- **保留 Cairn 的全部核心机制**：Fact/Intent/Hint 图、bootstrap/reason/explore、多任务并发、Intent 认领、心跳、reason lease、超时取消、conclude 收尾、图导出与 UI
 
-| Concept | Meaning |
-|---------|---------|
-| **Fact** | A confirmed, objective finding written to the board |
-| **Intent** | A declared direction of exploration, not yet executed |
-| **Hint** | Human judgment injected at any time; absorbed by agents on the next read |
+内置 agent 的工具集：
 
-The graph grows from `origin` toward `goal`. Every new Fact is a stepping stone; every Intent is a step into the unknown.
+- `bash`：在项目工作目录执行命令；大输出落文件，只把尾部返回模型
+- `read` / `write` / `edit`：读写和精确替换文件
+- `grep` / `find` / `ls`：搜索文件内容、按 glob 找文件、列目录
 
-Agent Workers run an OODA loop — Observe the full graph, Orient to the current state, Decide on next intents, Act to explore — and write their findings back as new Facts. Workers have no fixed roles. Tasks are generated at runtime from the graph's current state, not from predefined job descriptions.
+上下文接近窗口上限时会自动压缩：保留原始任务和最近的工作，把更早的轮次总结成摘要；完整命令输出始终保存在项目工作区的 `.cairn/outputs/` 下，可随时回读。
 
-Agents coordinate exclusively through the shared board (Stigmergy). No direct communication. No information silos.
+### 上下文长度与输出上限
 
-## Cairn in Action
+默认 `context_window = 1,000,000`（pi 的 DeepSeek catalog 数据），`max_tokens = 16384`（pi 的 `model-config.ts` / `provider-composer.ts` 默认最大输出）。DeepSeek catalog 里的 `maxTokens: 384000` 是模型能力上限，不是 pi 的默认请求值；直接拿它当默认可能被服务端以 400 拒绝。请按你实际使用的模型填写这两个值。
 
-https://github.com/user-attachments/assets/e557b1ac-dda4-41cb-87dd-9d56dbf05133
+内置 agent **不设置硬性的最大步数**，和 pi 的行为一致。任务由 dispatcher 的 phase timeout、项目停止、以及人工 Hint 控制；如果模型卡住，停止项目或注入 Hint 即可，不会由 agent 自己截断轮次。
 
-
-## How It Works
-
-Three task types, all executed by the same Worker:
-
-| Task | What it does | Output |
-|------|-------------|--------|
-| **Bootstrap** | At project start, attempts to solve the problem directly | Fact + possible Complete |
-| **Reason** | Reads the full graph: is the goal met? What should be explored next? | Complete / new Intents / no-op |
-| **Explore** | Claims one Intent, executes the exploration, reports findings | One Fact |
-
-System architecture:
+## 架构
 
 ```
           ┌──────────────────────────────────┐
           │           Cairn Server           │
           │    Facts + Intents + Hints       │
+          │    Settings（含模型配置）         │
           └─────────────────┬────────────────┘
                             │
                      Read / Write API
                             │
           ┌─────────────────┴────────────────┐
           │             Dispatcher           │
-          │   Schedules tasks, manages       │
-          │   containers, writes protocol    │
-          └──────────┬───────────────┬───────┘
-                     │               │
-     ┌───────────────┴──┐     ┌──────┴──────────────┐
-     │  Worker Container│     │  Worker Container   │
-     │   (Project A)    │     │   (Project B)       │
-     │  ┌────┐  ┌────┐  │     │  ┌────┐  ┌────┐     │
-     │  │ W. │  │ W. │  │     │  │ W. │  │ W. │     │
-     │  └────┘  └────┘  │     │  └────┘  └────┘     │
-     └──────────────────┘     └─────────────────────┘
+          │   调度任务 / 心跳 / 超时 / 写回    │
+          └─────────────────┬────────────────┘
+                            │ 每个任务一个子进程
+          ┌─────────────────┴────────────────┐
+          │        cairn.agent.worker        │
+          │  LLM 循环 + bash/read/write/edit │
+          │  上下文压缩 + session 落盘        │
+          └──────────────────────────────────┘
 ```
 
-**Cairn Server** maintains graph consistency only.
+每个项目在 `runtime.workspace_root` 下有一个独立工作目录，agent 的 cwd、session、工具输出都在里面。Dispatcher 仍然是唯一协议写入者，agent 不直接调用 Cairn API。
 
-**Cairn Dispatcher** reads the graph, schedules tasks, spins up and tears down worker containers, and is the sole writer to the protocol. Each project gets its own Worker Container; multiple Agent Workers run concurrently inside it. Agent Workers only receive a prompt and return structured output.
+## 快速开始（Linux / Kali）
 
-Workers can also run directly on the dispatcher host instead of in per-project containers — **local mode**, no Docker required. See [Local mode](#local-mode-no-docker) below.
+要求：
 
-Supported worker backends: **Claude Code**, **Codex**, and **Pi**.
-
-## Results
-
-**Tencent Cloud Hackathon · AI Penetration Testing Challenge · 2nd Edition**
-
-610 teams · 1,345 participants · top universities and security firms across China
-
-| Metric | Value |
-|--------|-------|
-| Problems solved | **54 / 54 — only team to AK** |
-| Final ranking | 3rd |
-
-> The system had never been tested before the competition. The full pipeline came online for the first time at 4 AM on race day. No training, no tuning, no domain-specific tooling. Zero MCP tools, zero RAG, zero predefined agent roles.
-
-## Further Reading
-
-- <a href="https://mp.weixin.qq.com/s/DlpEH7bVr0xi0VawPJs3XA" target="_blank" rel="noopener noreferrer">The Strongest AI Penetration Testing Agent: Postmortem of the Only Team to Achieve AK at the TCH Tencent Cloud Hackathon Intelligent Penetration Testing Challenge (2nd Edition)</a>
-- <a href="https://mp.weixin.qq.com/s/2rEqFLvkxvYWM3gW170C2w" target="_blank" rel="noopener noreferrer">The Pathless Path: Cairn AI from Penetration Testing to General Problem Solving</a>
-
-## Getting Started
-
-**Prerequisites**
- 
-- macOS or Linux
+- Linux（推荐 Kali）
 - Python ≥ 3.12
-- Docker (container execution only — not needed for local mode)
-
-
-### Pull required images
- 
-Both setup methods require the worker container image:
- 
-```bash
-docker pull --platform=linux/amd64 ghcr.io/oritera/cairn-worker-container:latest
-```
-
-Create your local dispatcher configuration and fill in your LLM endpoints and API keys:
+- [uv](https://docs.astral.sh/uv/)
+- 一个可用的 OpenAI 兼容或 Anthropic 模型接口
 
 ```bash
-cp dispatch.example.yaml dispatch.yaml
+git clone https://github.com/guaidao2/Cairn-Local.git
+cd Cairn
+
+# 1. 环境检测
+bash scripts/check-env.sh
+
+# 2. 安装依赖 + 生成 dispatch.yaml
+bash scripts/setup.sh
+
+# 3. 一键启动 server + dispatcher
+bash scripts/start.sh
 ```
- 
-### Docker Compose (recommended)
- 
-Pull the base image used to build Cairn:
- 
-```bash
-docker pull ghcr.io/astral-sh/uv:python3.13-trixie
+
+启动后打开：
+
 ```
- 
-```bash
-docker compose up --build
+http://<你的机器 IP>:8000
 ```
- 
-This starts `cairn-server` on port `8000` and `cairn-dispatcher` once the server passes its health check. The dispatcher mounts `dispatch.yaml` from the project root and connects to Docker via the host socket. Data is persisted to `./datas/cairn/`.
- 
-### Manual
- 
+
+> **局域网暴露说明**：`scripts/start.sh` 默认监听 `0.0.0.0`，方便比赛时 Kali 虚拟机开服务、物理机浏览器直接访问。Cairn 目前**没有内置登录/鉴权**，任何能访问该端口的人都能创建项目并让 agent 在宿主机执行命令。请只在授权内网、比赛虚拟机或你完全控制的网络中这样使用；不要把端口暴露到公网。
+
+进入 **服务器设置 → Agent 模型**：
+
+- 协议：OpenAI 兼容或 Anthropic
+- Base URL：例如 `https://api.deepseek.com/v1`
+- 模型名：例如 `deepseek-chat`
+- API Key：粘贴你的 Key（保存后 UI 只显示掩码，留空表示不修改）
+- 上下文长度、最大输出、温度、请求超时按需调整
+
+点 **测试连接** 确认可用，再点 **保存服务器设置**。Dispatcher 下一轮任务会自动使用新配置，不需要重启。
+
+其他命令：
+
 ```bash
-# Start the server
-uv run --project cairn cairn serve
- 
-# Run the dispatcher
+bash scripts/start.sh status
+bash scripts/start.sh logs dispatch
+bash scripts/start.sh stop
+bash scripts/start.sh restart
+```
+
+## 手动启动
+
+```bash
+# 终端 1：server
+uv run --project cairn cairn serve --host 0.0.0.0 --port 8000
+
+# 终端 2：dispatcher
 uv run --project cairn cairn dispatch --config dispatch.yaml
- 
-# Run startup health checks only
+```
+
+只做模型/配置检查：
+
+```bash
 uv run --project cairn cairn dispatch --config dispatch.yaml --startup-healthcheck-only
 ```
 
-### Local mode (no Docker)
+## 配置
 
-Instead of one container per project, workers can run directly on the dispatcher host, reusing the machine's already-configured `claude` / `codex` / `pi` CLIs — no Docker, and no API keys in the config.
+`dispatch.yaml` 由 `scripts/setup.sh` 从 `dispatch.example.yaml` 生成。关键项：
 
-```bash
-cp dispatch.local.example.yaml dispatch.yaml
+| 配置 | 说明 |
+|------|------|
+| `server` | Cairn Server 地址 |
+| `runtime.interval` | 调度轮询与心跳周期（秒） |
+| `runtime.max_workers` | 全局并发任务上限 |
+| `runtime.max_running_projects` | 同时调度的项目数 |
+| `runtime.max_project_workers` | 单项目并发上限 |
+| `runtime.workspace_root` | 每个项目的工作目录根 |
+| `runtime.completed_action` | 项目完成后 `keep` 或 `remove` 工作目录 |
+| `tasks.bootstrap/reason/explore` | 各阶段超时、conclude 超时、max_intents |
+| `workers` | 可省略；默认一个 `native` worker，模型配置来自 UI |
 
-# Start the server
-uv run --project cairn cairn serve
+模型、Base URL、API Key **不写在 `dispatch.yaml` 里**，避免配置文件和 shell history 泄露密钥。
 
-# Run the dispatcher on the same host, where the CLIs are installed and logged in
-uv run --project cairn cairn dispatch --config dispatch.yaml
+## 工作区
+
+```
+workspaces/
+└── proj_001/
+    ├── .cairn/
+    │   ├── sessions/     # 每个任务的对话/session（结论阶段复用）
+    │   ├── outputs/      # bash 完整输出
+    │   └── prompts/      # 图快照文件
+    └── ...               # agent 的 cwd，扫描结果、脚本、证据放这里
 ```
 
-Local mode is selected by `runtime.execution: local` (see `dispatch.local.example.yaml`). On startup the dispatcher checks each configured worker CLI is installed and runnable, and reminds you they must already be logged in. Each project gets an isolated working directory under `local.workspace_root` (default: the dispatcher's current directory). Run the dispatcher directly on the host — not inside Docker — since the agents run with your user's permissions and no sandbox.
+同一个任务的 execute 与 conclude 共用一个 session 文件。主阶段超时或输出无法解析时，conclude 会用同一 session 收尾，不会丢掉已经确认的工具结果。
 
-### Tests
-
-Run the fast regression suite without Docker or live model endpoints:
+## 测试
 
 ```bash
 uv run --project cairn --group dev pytest
 ```
 
-## Disclaimer
+不接真实模型、只验证调度与协议：
 
-Cairn is a general-purpose problem-solving engine. Although it supports penetration testing, CTF solving, security assessment, and vulnerability research workflows, it is intended to be used only in environments where you have explicit authorization to operate.
+```bash
+uv run --project cairn cairn serve
+uv run --project cairn cairn dispatch --config dispatch_mock.yaml
+```
 
-You are solely responsible for how you use this project. Do not use Cairn against systems, networks, applications, or data without clear prior permission from the owner or operator. Unauthorized security testing, exploitation, or data access may be illegal and may cause harm.
+## 安全说明
 
-The developers and contributors of this project do not endorse or accept responsibility for any misuse, abuse, damage, loss, or legal consequences arising from its use. By using this project, you agree to ensure that your activities comply with all applicable laws, regulations, contractual obligations, and professional or organizational policies in your jurisdiction.
+内置 agent 的工具直接在宿主机上以当前用户身份执行，没有容器沙箱。请只在你有明确授权的环境中使用，并自行承担使用责任。不要对未授权的系统、网络或数据运行 Cairn。
 
-## Star History
+## 进一步阅读
 
-<a href="https://www.star-history.com/#oritera/Cairn&Date" target="_blank" rel="noopener noreferrer">
-  <img src="https://api.star-history.com/svg?repos=oritera/Cairn&type=Date" alt="Star History Chart" />
-</a>
+- [Dispatcher 设计](docs/specs/dispatcher-design.md)
+- [Server 协议](docs/specs/server-protocol.md)
 
-## ⚖️ License
-This project is licensed under **GNU AGPLv3** for personal and educational use.
+## 致谢
 
-**Commercial Use**: If you wish to use this project in a commercial or proprietary environment without the AGPL-3.0 open-source obligations, **please contact me to obtain a commercial license.**
+Cairn 原始项目由 **oritera / leixiao** 创建并维护（[oritera/Cairn](https://github.com/oritera/Cairn)），最初的 Fact/Intent/Hint 图协议、Dispatcher 调度和比赛验证都来自原项目。本仓库是 **guaidao2** 基于原项目维护的二开版本，感谢原作者和 Tencent Hackathon 团队的工作。
 
-**Contributions**: By submitting a Pull Request, you agree that your contributions may be used under both the AGPL-3.0 and the project's commercial license.
+## License
+
+Copyright (C) 2026 **guaidao2**（二开版本）；原始项目版权归 oritera / leixiao 所有。
+
+本项目使用 **GNU AGPLv3**（许可证全文见 [LICENSE](LICENSE)，未修改原协议文本）。商业使用或希望在不承担 AGPL 开源义务的闭源环境中使用，请联系项目作者获取商业许可。
+
+通过提交 Pull Request，即表示你同意你的贡献可以同时按 AGPL-3.0 和项目的商业许可使用。

@@ -9,6 +9,7 @@ from pydantic import TypeAdapter
 import requests
 from requests.adapters import HTTPAdapter
 
+from cairn.agent.settings import AgentSettings
 from cairn.server.models import Intent, ProjectDetail, ProjectSummary, Settings
 
 LOG = logging.getLogger(__name__)
@@ -62,6 +63,16 @@ class CairnClient:
         response = self._session().get(self._url("/settings"), timeout=self._timeout)
         response.raise_for_status()
         return Settings.model_validate(response.json())
+
+    def get_agent_settings(self) -> AgentSettings:
+        response = self._session().get(self._url("/settings/agent"), timeout=self._timeout)
+        response.raise_for_status()
+        return AgentSettings.model_validate(response.json())
+
+    def test_agent_settings(self) -> ApiResult:
+        # The server performs a real model call here; the normal 10s API
+        # timeout is too short for slow providers.
+        return self._request_json("POST", "/settings/test", {}, timeout=90.0)
 
     def export_project(self, project_id: str) -> str:
         response = self._session().get(
@@ -128,13 +139,20 @@ class CairnClient:
             json={"from": from_ids, "description": description, "creator": creator, "worker": None},
         )
 
-    def _request_json(self, method: str, path: str, json: dict[str, Any]) -> ApiResult:
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        json: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> ApiResult:
         try:
             response = self._session().request(
                 method,
                 self._url(path),
                 json=json,
-                timeout=self._timeout,
+                timeout=timeout if timeout is not None else self._timeout,
             )
         except requests.RequestException as exc:
             LOG.warning("request failed method=%s path=%s error=%s", method, path, exc)

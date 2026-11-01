@@ -3,7 +3,7 @@ name = "cairn"
 version = "0.2.1"
 description = "Fact-graph based collaborative exploration protocol"
 authors = [
-    { name = "leixiao", email = "1729888211@qq.com" }
+    { name = "guaidao2" }
 ]
 requires-python = ">=3.12"
 dependencies = [
@@ -11,7 +11,6 @@ dependencies = [
     "uvicorn[standard]>=0.34",
     "click>=8.1",
     "pyyaml>=6.0",
-    "docker>=7.1.0",
     "requests>=2.32.3",
 ]
 

@@ -68,3 +68,28 @@ def test_configure_maps_disabled_bootstrap_mode_to_false(tmp_path, monkeypatch) 
         ("proj_001", 0),
         ("proj_002", 1),
     ]
+
+
+def test_configure_migrates_legacy_settings_table_before_seeding_agent_columns(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "legacy-settings.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE settings (
+                intent_timeout INTEGER NOT NULL DEFAULT 15,
+                reason_timeout INTEGER NOT NULL DEFAULT 15
+            )
+            """
+        )
+        conn.execute("INSERT INTO settings (rowid, intent_timeout, reason_timeout) VALUES (1, 15, 15)")
+
+    monkeypatch.setattr(db, "_db_path", None)
+    db.configure(path)
+
+    with db.get_conn() as conn:
+        row = conn.execute("SELECT * FROM settings WHERE rowid = 1").fetchone()
+    assert row["agent_provider"] == "openai"
+    assert row["agent_base_url"] == "https://api.deepseek.com/v1"
+    assert row["agent_model"] == "deepseek-chat"
+    assert row["agent_context_window"] == 1000000
+    assert row["agent_max_tokens"] == 16384

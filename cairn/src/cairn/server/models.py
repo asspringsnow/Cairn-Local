@@ -4,10 +4,34 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from cairn.agent.settings import AgentSettings
+
 
 class Settings(BaseModel):
     intent_timeout: int = Field(ge=5)
     reason_timeout: int = Field(ge=5)
+    agent: AgentSettings = Field(default_factory=AgentSettings)
+    api_key_configured: bool = False
+    api_key_hint: str = ""
+
+
+class SettingsUpdate(BaseModel):
+    intent_timeout: int = Field(ge=5)
+    reason_timeout: int = Field(ge=5)
+    agent: AgentSettings = Field(default_factory=AgentSettings)
+    clear_api_key: bool = False
+
+
+class TestSettingsRequest(BaseModel):
+    agent: AgentSettings | None = None
+    timeout: int = Field(default=30, ge=5, le=120)
+
+
+class TestSettingsResponse(BaseModel):
+    ok: bool
+    latency: float = 0.0
+    model: str = ""
+    detail: str = ""
 
 
 class Fact(BaseModel):

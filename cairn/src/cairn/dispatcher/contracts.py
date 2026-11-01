@@ -121,6 +121,10 @@ def validate_bootstrap_execute_payload(payload: dict[str, Any]) -> tuple[str, di
 
     result = {"fact_description": fact_description.strip()}
     complete = data.get("complete")
+    # Some models put ``complete`` inside ``fact`` when they forget one closing
+    # brace. The intent is unambiguous: accept it as a sibling.
+    if complete is None and isinstance(fact.get("complete"), dict):
+        complete = fact["complete"]
     if complete is None:
         raise ValueError("complete is required")
     if not isinstance(complete, dict):

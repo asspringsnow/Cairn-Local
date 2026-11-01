@@ -11,31 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 TaskType = Literal["reason", "explore", "bootstrap"]
-WorkerType = Literal["claudecode", "codex", "pi", "mock"]
-CompletedAction = Literal["remove", "stop"]
+WorkerType = Literal["native", "mock"]
+CompletedAction = Literal["keep", "remove"]
 WorkerHealthcheckMode = Literal["startup_and_task", "startup_only", "disabled"]
-ExecutionMode = Literal["container", "local"]
-LocalCompletedAction = Literal["keep", "remove"]
 
-WORKER_ENV_KEYS: dict[WorkerType, tuple[str, ...]] = {
-    "claudecode": (
-        "ANTHROPIC_MODEL",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_AUTH_TOKEN",
-    ),
-    "codex": (
-        "CODEX_MODEL",
-        "CODEX_BASE_URL",
-        "OPENAI_API_KEY",
-    ),
-    "pi": (
-        "PI_MODEL",
-        "PI_BASE_URL",
-        "PI_API_KEY",
-        "PI_PROVIDER_API",
-    ),
-    "mock": (),
-}
 
 DEFAULT_PROMPT_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
     "reason.md": ("{graph_yaml}", "{fact_ids}", "{open_intents}", "{max_intents}"),
@@ -65,10 +44,7 @@ MOCK_ALLOWED_OUTCOMES: dict[str, frozenset[str]] = {
 }
 
 MOCK_DEFAULT_BEHAVIOR: dict[str, dict[str, Any]] = {
-    "healthcheck": {
-        "delay": [0.05, 0.15],
-        "outcomes": {"ok": "1.0", "fail": "0.0"},
-    },
+    "healthcheck": {"delay": [0.05, 0.15], "outcomes": {"ok": "1.0", "fail": "0.0"}},
     "reason": {
         "delay": [0.05, 0.3],
         "outcomes": {
@@ -124,9 +100,7 @@ MOCK_DEFAULT_BEHAVIOR: dict[str, dict[str, Any]] = {
     },
 }
 
-MOCK_ALLOWED_ENV_KEYS = frozenset(
-    {f"MOCK_{phase.upper()}" for phase in MOCK_ALLOWED_OUTCOMES}
-)
+MOCK_ALLOWED_ENV_KEYS = frozenset({f"MOCK_{phase.upper()}" for phase in MOCK_ALLOWED_OUTCOMES})
 
 
 class ReasonTaskConfig(BaseModel):
@@ -150,37 +124,32 @@ class TasksConfig(BaseModel):
     explore: ExploreTaskConfig
 
 
-class ContainerConfig(BaseModel):
-    image: str
-    network_mode: str
-    completed_action: CompletedAction
-    cap_add: list[str] = Field(default_factory=list)
-
-
-class LocalConfig(BaseModel):
-    workspace_root: str | None = None
-    completed_action: LocalCompletedAction = "keep"
-
-
 class RuntimeConfig(BaseModel):
     max_workers: int = Field(gt=0)
     max_running_projects: int = Field(gt=0)
     max_project_workers: int = Field(gt=0)
     interval: int = Field(gt=0)
-    healthcheck_timeout: int = Field(gt=0)
+    healthcheck_timeout: int = Field(gt=0, default=20)
     worker_healthcheck: WorkerHealthcheckMode = "startup_only"
-    execution: ExecutionMode = "container"
-    prompt_group: str = Field(min_length=1)
+    prompt_group: str = Field(default="default", min_length=1)
+    workspace_root: str | None = None
+    completed_action: CompletedAction = "keep"
 
 
 class WorkerConfig(BaseModel):
+    """A worker definition.
+
+    Production uses exactly one ``native`` worker backed by the server's model
+    settings. ``mock`` remains available for deterministic scheduler tests.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    name: str
-    type: WorkerType
-    task_types: list[TaskType]
-    max_running: int = Field(gt=0)
-    priority: int = Field(ge=0)
+    name: str = "cairn"
+    type: WorkerType = "native"
+    task_types: list[TaskType] = Field(default_factory=lambda: ["bootstrap", "reason", "explore"])
+    max_running: int = Field(default=1, gt=0)
+    priority: int = Field(default=0, ge=0)
     env: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("task_types")
@@ -194,11 +163,6 @@ class WorkerConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_env(self) -> "WorkerConfig":
-        # Required LLM env keys (base_url / key / model) are enforced per execution mode by
-        # DispatchConfig: container mode needs them, local mode reuses the host CLI config.
-        # The checks below are mode-independent and always apply.
-        if self.type == "pi":
-            _validate_optional_positive_int_env(self.name, self.env, "PI_MODEL_CONTEXT_WINDOW")
         if self.type == "mock":
             resolve_mock_behavior(self.name, self.env)
         return self
@@ -210,10 +174,8 @@ class DispatchConfig(BaseModel):
     server: str
     runtime: RuntimeConfig
     tasks: TasksConfig
-    container: ContainerConfig | None = None
-    local: LocalConfig | None = None
     common_env: dict[str, str] = Field(default_factory=dict)
-    workers: list[WorkerConfig]
+    workers: list[WorkerConfig] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -226,7 +188,6 @@ class DispatchConfig(BaseModel):
         workers = data.get("workers")
         if not isinstance(common_env, dict) or not isinstance(workers, list):
             return data
-
         merged = dict(data)
         merged_workers: list[Any] = []
         for worker in workers:
@@ -247,29 +208,30 @@ class DispatchConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_workers(self) -> "DispatchConfig":
+        if self.runtime.max_project_workers > self.runtime.max_workers:
+            raise ValueError("max_project_workers cannot exceed max_workers")
+        if not self.workers:
+            self.workers = [
+                WorkerConfig(
+                    name="cairn",
+                    type="native",
+                    task_types=["bootstrap", "reason", "explore"],
+                    max_running=self.runtime.max_workers,
+                    priority=0,
+                )
+            ]
         names = [worker.name for worker in self.workers]
         if len(set(names)) != len(names):
             raise ValueError("worker names must be unique")
-        if not self.workers:
-            raise ValueError("workers must not be empty")
-        if self.runtime.max_project_workers > self.runtime.max_workers:
-            raise ValueError("max_project_workers cannot exceed max_workers")
+        if len([worker for worker in self.workers if worker.type == "native"]) > 1:
+            raise ValueError("only one native worker is supported")
         return self
 
-    @model_validator(mode="after")
-    def validate_execution_mode(self) -> "DispatchConfig":
-        if self.runtime.execution == "container":
-            if self.container is None:
-                raise ValueError("container config is required when runtime.execution is container")
-            for worker in self.workers:
-                required = WORKER_ENV_KEYS[worker.type]
-                missing = [key for key in required if not worker.env.get(key)]
-                if missing:
-                    raise ValueError(f"worker {worker.name} missing env keys: {', '.join(missing)}")
-        else:  # local: workers reuse the host CLI config, so no LLM env keys are required
-            if self.local is None:
-                self.local = LocalConfig()
-        return self
+    @property
+    def workspace_root(self) -> Path:
+        if self.runtime.workspace_root:
+            return Path(self.runtime.workspace_root).expanduser()
+        return Path.cwd()
 
     @classmethod
     def load(cls, path: Path) -> "DispatchConfig":
@@ -277,18 +239,6 @@ class DispatchConfig(BaseModel):
         config = cls.model_validate(data)
         validate_prompt_resources(config.runtime.prompt_group)
         return config
-
-
-def _validate_optional_positive_int_env(worker_name: str, env: dict[str, str], key: str) -> None:
-    value = env.get(key)
-    if value is None or not value.strip():
-        return
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise ValueError(f"worker {worker_name} env {key} must be an integer") from exc
-    if parsed <= 0:
-        raise ValueError(f"worker {worker_name} env {key} must be greater than 0")
 
 
 def validate_prompt_resources(prompt_group: str) -> None:
@@ -328,12 +278,7 @@ def resolve_mock_behavior(worker_name: str, env: dict[str, str]) -> dict[str, di
         outcomes: dict[str, float] = {}
         total = Decimal("0")
         for outcome in sorted(allowed_outcomes):
-            weight = _parse_mock_probability(
-                worker_name,
-                prefix,
-                raw_outcomes,
-                outcome,
-            )
+            weight = _parse_mock_probability(worker_name, prefix, raw_outcomes, outcome)
             outcomes[outcome] = float(weight)
             total += weight
         if total != Decimal("1"):

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 
+import pytest
+
+from cairn.agent.settings import AgentSettings
+from cairn.dispatcher.config import DispatchConfig
 from cairn.dispatcher.models import ReasonCheckpoint, RunningTask
+from cairn.dispatcher.protocol.client import ApiResult
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.scheduler.loop import DispatcherLoop
 from cairn.dispatcher.scheduler.worker_select import choose_worker
@@ -22,7 +27,17 @@ def _loop() -> DispatcherLoop:
     loop.worker_rejected_until = {}
     loop._log_state = {}
     loop.project_cursor = 0
+    loop.workspace = type("Workspace", (), {"container_name": lambda _self, project_id: project_id})()
+    loop.agent_settings = None
+    loop._agent_settings_signature = None
     return loop
+
+
+def _native_config() -> DispatchConfig:
+    config = make_config()
+    return config.model_copy(
+        update={"workers": [config.workers[0].model_copy(update={"type": "native"})]}
+    )
 
 
 def _summary(project_id: str, status: str) -> ProjectSummary:
@@ -134,7 +149,7 @@ def test_new_fact_dispatches_reason_before_unclaimed_explore_intent() -> None:
         hint_count=1,
         open_intent_count=1,
     )
-    loop.container_manager = type("Containers", (), {"container_name": lambda _self, project_id: project_id})()
+    loop.workspace = type("Workspace", (), {"container_name": lambda _self, project_id: project_id})()
     loop.client = type(
         "Client",
         (),
@@ -164,7 +179,7 @@ def test_initial_enabled_project_without_bootstrap_worker_dispatches_reason() ->
     loop.futures = {}
     project = make_project()
     project.facts = project.facts[:2]
-    loop.container_manager = type("Containers", (), {"container_name": lambda _self, project_id: project_id})()
+    loop.workspace = type("Workspace", (), {"container_name": lambda _self, project_id: project_id})()
     loop.client = type(
         "Client",
         (),
@@ -188,7 +203,7 @@ def test_initial_disabled_project_skips_configured_bootstrap_worker() -> None:
     project = make_project()
     project.project.bootstrap_enabled = False
     project.facts = project.facts[:2]
-    loop.container_manager = type("Containers", (), {"container_name": lambda _self, project_id: project_id})()
+    loop.workspace = type("Workspace", (), {"container_name": lambda _self, project_id: project_id})()
     loop.client = type(
         "Client",
         (),
@@ -297,37 +312,55 @@ def test_select_worker_reports_busy_unhealthy_rejected_and_unsupported_workers(m
     assert selection.blocked_task_type == ["unsupported"]
 
 
-def test_disabled_worker_healthcheck_skips_automatic_startup_but_force_runs_diagnostic() -> None:
+def test_startup_healthcheck_skips_when_model_not_configured() -> None:
     loop = _loop()
-    config = make_config()
-    loop.config = config.model_copy(
-        update={"runtime": config.runtime.model_copy(update={"worker_healthcheck": "disabled"})}
-    )
-    calls: list[bool] = []
-    loop._run_startup_healthchecks = lambda *, show_commands: calls.append(show_commands)
+    loop.config = _native_config()
+    loop.client = type("Client", (), {"get_agent_settings": lambda _self: AgentSettings(api_key="", model="", base_url="")})()
     loop._startup_healthchecks_checked = False
 
     loop.run_startup_healthchecks()
 
-    assert calls == []
+    assert loop._startup_healthchecks_checked
+    assert loop.agent_settings is None
+
+
+def test_startup_healthcheck_force_raises_when_model_not_configured() -> None:
+    loop = _loop()
+    loop.config = _native_config()
+    loop.client = type("Client", (), {"get_agent_settings": lambda _self: AgentSettings(api_key="", model="", base_url="")})()
+    loop._startup_healthchecks_checked = False
+
+    with pytest.raises(RuntimeError, match="not configured"):
+        loop.run_startup_healthchecks(force=True)
+
+
+def test_startup_healthcheck_pings_configured_model() -> None:
+    loop = _loop()
+    loop.config = _native_config()
+    settings = AgentSettings(api_key="dummy", model="deepseek-chat", base_url="http://model")
+    loop.client = type(
+        "Client",
+        (),
+        {
+            "get_agent_settings": lambda _self: settings,
+            "test_agent_settings": lambda _self: ApiResult(200, {"ok": True}),
+        },
+    )()
+    loop._startup_healthchecks_checked = False
+
+    loop.run_startup_healthchecks(force=True)
+
+    assert loop.agent_settings is settings
     assert loop._startup_healthchecks_checked
 
-    loop._startup_healthchecks_checked = False
-    loop.run_startup_healthchecks(show_commands=True, force=True)
 
-    assert calls == [True]
-
-
-def test_startup_only_worker_healthcheck_runs_automatic_startup_check() -> None:
+def test_mock_only_startup_skips_model_healthcheck() -> None:
     loop = _loop()
-    config = make_config()
-    loop.config = config.model_copy(
-        update={"runtime": config.runtime.model_copy(update={"worker_healthcheck": "startup_only"})}
-    )
-    calls: list[bool] = []
-    loop._run_startup_healthchecks = lambda *, show_commands: calls.append(show_commands)
+    loop.config = make_config()
+    loop.agent_settings = None
     loop._startup_healthchecks_checked = False
 
-    loop.run_startup_healthchecks()
+    loop.run_startup_healthchecks(force=True)
 
-    assert calls == [False]
+    assert loop._startup_healthchecks_checked
+    assert loop.agent_settings is None

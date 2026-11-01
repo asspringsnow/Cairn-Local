@@ -2,20 +2,18 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
-import os
-import subprocess
-import threading
 from typing import Any
 
 from fastapi.testclient import TestClient
 from pydantic import TypeAdapter
 import pytest
 
+from cairn.agent.settings import AgentSettings
 from cairn.dispatcher.config import DispatchConfig
 from cairn.dispatcher.models import ReasonCheckpoint
 from cairn.dispatcher.protocol.client import ApiResult
-from cairn.dispatcher.runtime.process import ProcessResult
 from cairn.dispatcher.scheduler.loop import DispatcherLoop
+from cairn.dispatcher.runtime.workspace import WorkspaceManager
 from cairn.server import db
 from cairn.server.app import app
 from cairn.server.models import ProjectDetail, ProjectSummary, Settings
@@ -88,98 +86,17 @@ class InProcessClient:
         return ApiResult(response.status_code, data, response.text)
 
 
-class LocalProcess:
-    def __init__(self, command: list[str], env: dict[str, str]):
-        self.command = command
-        self.env = env
-        self._process: subprocess.Popen[str] | None = None
-        self._cancel_reason: str | None = None
-        self._lock = threading.Lock()
-
-    def start(self) -> None:
-        with self._lock:
-            self._process = subprocess.Popen(
-                self.command,
-                env={**os.environ, **self.env},
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-
-    def communicate(self, timeout: float | None) -> ProcessResult:
-        assert self._process is not None
-        timed_out = False
-        try:
-            stdout, stderr = self._process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            self.kill()
-            stdout, stderr = self._process.communicate()
-        return ProcessResult(
-            returncode=self._process.returncode,
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=timed_out,
-            cancelled=self._cancel_reason is not None,
-            cancel_reason=self._cancel_reason,
-        )
-
-    def kill(self) -> None:
-        with self._lock:
-            process = self._process
-        if process is not None and process.poll() is None:
-            process.kill()
-
-    def cancel(self, reason: str) -> None:
-        if self._cancel_reason is None:
-            self._cancel_reason = reason
-        self.kill()
-
-
-class LocalContainerManager:
-    def __init__(self) -> None:
-        self.writes: list[tuple[str, str, str]] = []
-
-    def close(self) -> None:
-        return None
-
-    def container_name(self, project_id: str) -> str:
-        return f"local-{project_id}"
-
-    def ensure_running(self, project_id: str) -> str:
-        return self.container_name(project_id)
-
-    def build_exec_process(
-        self,
-        _container_name: str,
-        env: dict[str, str],
-        command: list[str],
-        timeout_seconds: int | None = None,
-        kill_after_seconds: int = 5,
-    ) -> LocalProcess:
-        assert timeout_seconds is not None
-        assert kill_after_seconds == 5
-        return LocalProcess(command, env)
-
-    def write_text_file(self, container_name: str, path: str, content: str) -> None:
-        self.writes.append((container_name, path, content))
-
-    def needs_completed_cleanup(self, _project_id: str) -> bool:
-        return False
-
-    def needs_stopped_cleanup(self, _project_id: str) -> bool:
-        return False
-
-    def managed_container_names(self) -> list[str]:
-        return []
-
-
 @pytest.fixture
 def http_client(tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setattr(db, "_db_path", None)
     db.configure(tmp_path / "cairn.db")
     with TestClient(app) as client:
         yield client
+
+
+@pytest.fixture
+def workspace(tmp_path) -> WorkspaceManager:
+    return WorkspaceManager(tmp_path / "work")
 
 
 def _phase(
@@ -222,11 +139,6 @@ def _config(
                 "reason": {"timeout": 2, "max_intents": 1},
                 "explore": {"timeout": 2, "conclude_timeout": 2},
             },
-            "container": {
-                "image": "unused",
-                "network_mode": "host",
-                "completed_action": "stop",
-            },
             "workers": [
                 {
                     "name": "mock-worker",
@@ -246,11 +158,15 @@ def _config(
     )
 
 
-def _loop(config: DispatchConfig, client: InProcessClient, containers: LocalContainerManager) -> DispatcherLoop:
+def _loop(config: DispatchConfig, client: InProcessClient, workspace: WorkspaceManager) -> DispatcherLoop:
     loop = DispatcherLoop.__new__(DispatcherLoop)
     loop.config = config
     loop.client = client
-    loop.container_manager = containers
+    loop.workspace = workspace
+    loop.agent_settings = AgentSettings(api_key="dummy", model="dummy", base_url="http://dummy")
+    loop._agent_settings_signature = None
+    loop._refresh_agent_settings = lambda: None
+    loop.run_startup_healthchecks = lambda **kwargs: None
     loop.executor = ThreadPoolExecutor(max_workers=config.runtime.max_workers)
     loop.cleanup_executor = ThreadPoolExecutor(max_workers=1)
     loop.futures = {}
@@ -272,7 +188,7 @@ def _dispatch_and_wait(loop: DispatcherLoop) -> None:
     loop._initialize_reason_checkpoints(summaries)
     loop._refresh_runtime_projects(summaries)
     loop._cancel_inactive_tasks(summaries)
-    loop._queue_container_cleanups(summaries)
+    loop._queue_workspace_cleanups(summaries)
     loop._dispatch_available(summaries)
     assert loop.futures
     for future in list(loop.futures):
@@ -289,9 +205,8 @@ def _create_project(http: TestClient) -> str:
     return response.json()["project"]["id"]
 
 
-def test_mock_scheduler_bootstrap_completes_project_end_to_end(http_client: TestClient) -> None:
+def test_mock_scheduler_bootstrap_completes_project_end_to_end(http_client: TestClient, workspace: WorkspaceManager) -> None:
     client = InProcessClient(http_client)
-    containers = LocalContainerManager()
     loop = _loop(
         _config(
             bootstrap=_phase("complete"),
@@ -299,7 +214,7 @@ def test_mock_scheduler_bootstrap_completes_project_end_to_end(http_client: Test
             explore=_phase("fact"),
         ),
         client,
-        containers,
+        workspace,
     )
     project_id = _create_project(http_client)
 
@@ -314,9 +229,8 @@ def test_mock_scheduler_bootstrap_completes_project_end_to_end(http_client: Test
     assert [(intent.id, intent.to) for intent in project.intents] == [("i001", "f001"), ("i002", "goal")]
 
 
-def test_mock_scheduler_runs_reason_explore_reason_complete_chain(http_client: TestClient) -> None:
+def test_mock_scheduler_runs_reason_explore_reason_complete_chain(http_client: TestClient, workspace: WorkspaceManager) -> None:
     client = InProcessClient(http_client)
-    containers = LocalContainerManager()
     loop = _loop(
         _config(
             bootstrap=_phase("complete"),
@@ -324,7 +238,7 @@ def test_mock_scheduler_runs_reason_explore_reason_complete_chain(http_client: T
             explore=_phase("fact"),
         ),
         client,
-        containers,
+        workspace,
     )
     project_id = _create_project(http_client)
     seed = client.create_intent(project_id, ["origin"], "seed", "seed-worker")
@@ -348,15 +262,16 @@ def test_mock_scheduler_runs_reason_explore_reason_complete_chain(http_client: T
         ("i002", "f002"),
         ("i003", "goal"),
     ]
-    assert any("/reason_execute-" in path and "f002" in content for _, path, content in containers.writes)
-    assert any("/explore_execute-" in path and "f001" in content for _, path, content in containers.writes)
+    prompt_root = workspace.project_dir(project_id) / ".cairn" / "prompts"
+    assert any(p.parent.name.startswith("reason_execute-") and "f002" in p.read_text(encoding="utf-8") for p in prompt_root.glob("*/graph.yaml"))
+    assert any(p.parent.name.startswith("explore_execute-") and "f001" in p.read_text(encoding="utf-8") for p in prompt_root.glob("*/graph.yaml"))
 
 
 def test_mock_scheduler_enabled_project_skips_bootstrap_when_worker_does_not_support_it(
     http_client: TestClient,
+    workspace: WorkspaceManager,
 ) -> None:
     client = InProcessClient(http_client)
-    containers = LocalContainerManager()
     loop = _loop(
         _config(
             bootstrap=_phase("complete"),
@@ -365,7 +280,7 @@ def test_mock_scheduler_enabled_project_skips_bootstrap_when_worker_does_not_sup
             task_types=["reason", "explore"],
         ),
         client,
-        containers,
+        workspace,
     )
     project_id = _create_project(http_client)
 
@@ -381,9 +296,8 @@ def test_mock_scheduler_enabled_project_skips_bootstrap_when_worker_does_not_sup
     ]
 
 
-def test_task_healthcheck_healthy_worker_completes_end_to_end(http_client: TestClient) -> None:
+def test_task_healthcheck_healthy_worker_completes_end_to_end(http_client: TestClient, workspace: WorkspaceManager) -> None:
     client = InProcessClient(http_client)
-    containers = LocalContainerManager()
     loop = _loop(
         _config(
             bootstrap=_phase("complete"),
@@ -392,7 +306,7 @@ def test_task_healthcheck_healthy_worker_completes_end_to_end(http_client: TestC
             worker_healthcheck="startup_and_task",
         ),
         client,
-        containers,
+        workspace,
     )
     project_id = _create_project(http_client)
 
@@ -406,9 +320,8 @@ def test_task_healthcheck_healthy_worker_completes_end_to_end(http_client: TestC
     assert project.project.status == "completed"
 
 
-def test_task_healthcheck_failure_aborts_task_and_cools_down_worker(http_client: TestClient) -> None:
+def test_task_healthcheck_failure_aborts_task_and_cools_down_worker(http_client: TestClient, workspace: WorkspaceManager) -> None:
     client = InProcessClient(http_client)
-    containers = LocalContainerManager()
     loop = _loop(
         _config(
             bootstrap=_phase("complete"),
@@ -418,7 +331,7 @@ def test_task_healthcheck_failure_aborts_task_and_cools_down_worker(http_client:
             healthcheck=_phase("fail", zero_outcomes=["ok"]),
         ),
         client,
-        containers,
+        workspace,
     )
     project_id = _create_project(http_client)
 
@@ -467,7 +380,6 @@ def _failover_config() -> DispatchConfig:
                 "reason": {"timeout": 2, "max_intents": 1},
                 "explore": {"timeout": 2, "conclude_timeout": 2},
             },
-            "container": {"image": "unused", "network_mode": "host", "completed_action": "stop"},
             "workers": [
                 worker("bad", 0, _phase("fail", zero_outcomes=["ok"])),
                 worker("good", 1, _phase("ok")),
@@ -476,10 +388,9 @@ def _failover_config() -> DispatchConfig:
     )
 
 
-def test_unhealthy_worker_fails_over_to_healthy_worker(http_client: TestClient) -> None:
+def test_unhealthy_worker_fails_over_to_healthy_worker(http_client: TestClient, workspace: WorkspaceManager) -> None:
     client = InProcessClient(http_client)
-    containers = LocalContainerManager()
-    loop = _loop(_failover_config(), client, containers)
+    loop = _loop(_failover_config(), client, workspace)
     project_id = _create_project(http_client)
 
     try:

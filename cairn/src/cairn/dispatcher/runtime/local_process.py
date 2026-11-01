@@ -107,6 +107,18 @@ class LocalProcess:
             process = self._process
             if process is None or process.poll() is not None:
                 return
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    with suppress(OSError):
+                        process.kill()
+                return
             self._signal_group(process, signal.SIGTERM)
             try:
                 process.wait(timeout=self._term_grace)

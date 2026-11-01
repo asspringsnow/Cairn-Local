@@ -3,25 +3,25 @@ from __future__ import annotations
 import logging
 import time
 
+from cairn.agent.settings import AgentSettings
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
 from cairn.dispatcher.contracts import parse_json_output, validate_explore_payload
 from cairn.dispatcher.prompting import load_prompt, render_prompt
 from cairn.dispatcher.protocol.client import CairnClient
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
-from cairn.dispatcher.runtime.containers import ContainerManager
 from cairn.dispatcher.runtime.heartbeat import HeartbeatLease
+from cairn.dispatcher.runtime.workspace import WorkspaceManager
 from cairn.dispatcher.tasks.common import (
     best_effort_release,
     cancel_reason,
     did_timeout,
-    project_allows_conclude_fallback,
     preview,
-    run_worker_process,
+    project_allows_conclude_fallback,
     task_healthcheck_enabled,
     write_conclude_result,
     write_graph_snapshot_reference,
 )
-from cairn.dispatcher.workers.registry import get_driver
+from cairn.dispatcher.tasks.session import WorkerSession
 from cairn.server.models import Intent, ProjectDetail
 
 LOG = logging.getLogger(__name__)
@@ -30,59 +30,39 @@ LOG = logging.getLogger(__name__)
 def run_explore_task(
     config: DispatchConfig,
     client: CairnClient,
-    container_manager: ContainerManager,
+    workspace: WorkspaceManager,
+    agent_settings: AgentSettings,
     project: ProjectDetail,
     export_yaml: str,
     intent: Intent,
     worker: WorkerConfig,
     cancellation: TaskCancellation,
 ) -> str:
-    driver = get_driver(worker.type, config.runtime.execution)
     task_started = time.perf_counter()
-    healthcheck_timeout = config.runtime.healthcheck_timeout
+    session = WorkerSession(
+        config,
+        workspace,
+        project.project.id,
+        worker,
+        agent_settings,
+        task_type="explore",
+        run_id=f"explore-{intent.id}",
+    )
     lease = HeartbeatLease.for_intent(client, project.project.id, intent.id, worker.name, config.runtime.interval)
     lease.start()
+    session.attach(lease, cancellation)
     try:
-        container_name = container_manager.ensure_running(project.project.id)
-
         if task_healthcheck_enabled(config):
-            LOG.info(
-                "checking worker health project=%s intent=%s worker=%s timeout=%ss",
-                project.project.id,
-                intent.id,
-                worker.name,
-                healthcheck_timeout,
-            )
-            health = driver.check_health(worker, timeout=healthcheck_timeout)
+            LOG.info("checking agent model project=%s intent=%s worker=%s timeout=%ss", project.project.id, intent.id, worker.name, config.runtime.healthcheck_timeout)
+            health = session.ping(config.runtime.healthcheck_timeout)
             if cancellation.is_cancelled:
-                LOG.info(
-                    "explore cancelled during healthcheck project=%s intent=%s worker=%s reason=%s",
-                    project.project.id,
-                    intent.id,
-                    worker.name,
-                    cancellation.reason,
-                )
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "cancelled"
             if lease.failure is not None:
-                LOG.warning(
-                    "heartbeat lost during explore healthcheck project=%s intent=%s worker=%s status=%s",
-                    project.project.id,
-                    intent.id,
-                    worker.name,
-                    lease.failure.status_code,
-                )
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "failed"
             if not health.ok:
-                LOG.warning(
-                    "worker unhealthy project=%s intent=%s worker=%s status=%s detail=%s",
-                    project.project.id,
-                    intent.id,
-                    worker.name,
-                    health.status,
-                    health.detail,
-                )
+                LOG.warning("agent model unhealthy project=%s intent=%s worker=%s detail=%s", project.project.id, intent.id, worker.name, health.detail)
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "unhealthy"
 
@@ -90,8 +70,7 @@ def run_explore_task(
             load_prompt(config.runtime.prompt_group, "explore.md"),
             {
                 "graph_yaml": write_graph_snapshot_reference(
-                    container_manager,
-                    container_name,
+                    session.workspace_path,
                     export_yaml.strip(),
                     phase="explore_execute",
                 ),
@@ -99,87 +78,37 @@ def run_explore_task(
                 "intent_description": intent.description,
             },
         )
-
-        session = driver.prepare_session()
-        execute = driver.build_execute(worker, prompt, session)
-        session = execute.session
         execute_started = time.perf_counter()
-        first = _run_process(
-            container_manager,
-            container_name,
-            worker,
-            execute.argv,
-            phase="explore_execute",
-            timeout=config.tasks.explore.timeout,
-            lease=lease,
-            cancellation=cancellation,
-        )
+        first = session.run(prompt, phase="explore_execute", timeout=config.tasks.explore.timeout, tools=True)
         execute_ms = int((time.perf_counter() - execute_started) * 1000)
-        session = driver.extract_session(session, first.stdout, first.stderr)
+        total_ms = int((time.perf_counter() - task_started) * 1000)
         cancelled = cancel_reason(first, cancellation)
         if cancelled is not None:
-            LOG.info(
-                "explore cancelled project=%s intent=%s worker=%s reason=%s execute_ms=%s",
-                project.project.id,
-                intent.id,
-                worker.name,
-                cancelled,
-                execute_ms,
-            )
+            LOG.info("explore cancelled project=%s intent=%s worker=%s reason=%s execute_ms=%s", project.project.id, intent.id, worker.name, cancelled, execute_ms)
             best_effort_release(client, project.project.id, intent.id, worker.name)
             return "cancelled"
         if lease.failure is not None:
-            LOG.warning(
-                "heartbeat lost during explore project=%s intent=%s worker=%s status=%s execute_ms=%s",
-                project.project.id,
-                intent.id,
-                worker.name,
-                lease.failure.status_code,
-                execute_ms,
-            )
+            LOG.warning("heartbeat lost during explore project=%s intent=%s worker=%s status=%s execute_ms=%s", project.project.id, intent.id, worker.name, lease.failure.status_code, execute_ms)
             best_effort_release(client, project.project.id, intent.id, worker.name)
             return "failed"
         if not did_timeout(first) and first.returncode == 0:
             try:
-                model_output = driver.extract_response_text(first.stdout, first.stderr)
-                payload = parse_json_output(model_output)
+                payload = parse_json_output(session.response_text(first))
                 kind, description = validate_explore_payload(payload)
             except Exception as exc:
                 LOG.warning(
-                    "explore parse failed project=%s intent=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
+                    "explore parse failed project=%s intent=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s",
                     project.project.id,
                     intent.id,
                     worker.name,
                     exc,
                     execute_ms,
-                    int((time.perf_counter() - task_started) * 1000),
+                    total_ms,
                     preview(first.stdout),
-                    preview(first.stderr),
                 )
-                return _try_conclude_fallback(
-                    config,
-                    client,
-                    container_manager,
-                    container_name,
-                    worker,
-                    driver,
-                    project.project.id,
-                    intent,
-                    export_yaml,
-                    session,
-                    lease,
-                    cancellation,
-                )
+                return _try_conclude_fallback(config, client, session, project, intent, export_yaml, lease, cancellation)
             if kind == "rejected":
-                LOG.warning(
-                    "explore rejected project=%s intent=%s worker=%s execute_ms=%s total_ms=%s stdout_preview=%s",
-                    project.project.id,
-                    intent.id,
-                    worker.name,
-                    execute_ms,
-                    int((time.perf_counter() - task_started) * 1000),
-                    preview(first.stdout),
-                )
+                LOG.warning("explore rejected project=%s intent=%s worker=%s execute_ms=%s total_ms=%s", project.project.id, intent.id, worker.name, execute_ms, total_ms)
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "rejected"
             return write_conclude_result(
@@ -190,42 +119,27 @@ def run_explore_task(
                 description,
                 source="explore_execute",
                 phase_ms=execute_ms,
-                total_ms=int((time.perf_counter() - task_started) * 1000),
+                total_ms=total_ms,
             )
         if did_timeout(first):
             LOG.warning(
-                "explore timed out project=%s intent=%s worker=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
+                "explore timed out project=%s intent=%s worker=%s execute_ms=%s total_ms=%s stdout_preview=%s",
                 project.project.id,
                 intent.id,
                 worker.name,
                 execute_ms,
-                int((time.perf_counter() - task_started) * 1000),
+                total_ms,
                 preview(first.stdout),
-                preview(first.stderr),
             )
-            return _try_conclude_fallback(
-                config,
-                client,
-                container_manager,
-                container_name,
-                worker,
-                driver,
-                project.project.id,
-                intent,
-                export_yaml,
-                session,
-                lease,
-                cancellation,
-            )
+            return _try_conclude_fallback(config, client, session, project, intent, export_yaml, lease, cancellation)
         LOG.warning(
-            "explore command failed project=%s intent=%s worker=%s code=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
+            "explore agent failed project=%s intent=%s worker=%s code=%s execute_ms=%s total_ms=%s stderr_preview=%s",
             project.project.id,
             intent.id,
             worker.name,
             first.returncode,
             execute_ms,
-            int((time.perf_counter() - task_started) * 1000),
-            preview(first.stdout),
+            total_ms,
             preview(first.stderr),
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
@@ -236,65 +150,46 @@ def run_explore_task(
         return "failed"
     finally:
         lease.stop()
+        session.close()
 
 
 def _try_conclude_fallback(
     config: DispatchConfig,
     client: CairnClient,
-    container_manager: ContainerManager,
-    container_name: str,
-    worker: WorkerConfig,
-    driver,
-    project_id: str,
+    session: WorkerSession,
+    project: ProjectDetail,
     intent: Intent,
     export_yaml: str,
-    session: str | None,
     lease: HeartbeatLease,
     cancellation: TaskCancellation,
 ) -> str:
-    if not driver.supports_conclude() or not session:
+    if not session.supports_conclude or not session.has_session:
         LOG.info(
             "conclude fallback unavailable project=%s intent=%s worker=%s supports_conclude=%s has_session=%s",
-            project_id,
+            project.project.id,
             intent.id,
-            worker.name,
-            driver.supports_conclude(),
-            bool(session),
+            session.worker.name,
+            session.supports_conclude,
+            session.has_session,
         )
-        best_effort_release(client, project_id, intent.id, worker.name)
+        best_effort_release(client, project.project.id, intent.id, session.worker.name)
         return "failed"
     if lease.failure is not None:
-        LOG.warning("conclude fallback skipped because heartbeat already lost project=%s intent=%s worker=%s", project_id, intent.id, worker.name)
-        best_effort_release(client, project_id, intent.id, worker.name)
+        LOG.warning("conclude fallback skipped because heartbeat already lost project=%s intent=%s worker=%s", project.project.id, intent.id, session.worker.name)
+        best_effort_release(client, project.project.id, intent.id, session.worker.name)
         return "failed"
     if cancellation.is_cancelled:
-        LOG.info(
-            "conclude fallback skipped because task was cancelled project=%s intent=%s worker=%s reason=%s",
-            project_id,
-            intent.id,
-            worker.name,
-            cancellation.reason,
-        )
-        best_effort_release(client, project_id, intent.id, worker.name)
+        best_effort_release(client, project.project.id, intent.id, session.worker.name)
         return "cancelled"
-
-    if not project_allows_conclude_fallback(
-        client,
-        project_id,
-        worker_name=worker.name,
-        intent_id=intent.id,
-    ):
-        best_effort_release(client, project_id, intent.id, worker.name)
+    if not project_allows_conclude_fallback(client, project.project.id, worker_name=session.worker.name, intent_id=intent.id):
+        best_effort_release(client, project.project.id, intent.id, session.worker.name)
         return "failed"
-
-    container_name = container_manager.ensure_running(project_id)
 
     prompt = render_prompt(
         load_prompt(config.runtime.prompt_group, "explore_conclude.md"),
         {
             "graph_yaml": write_graph_snapshot_reference(
-                container_manager,
-                container_name,
+                session.workspace_path,
                 export_yaml.strip(),
                 phase="explore_conclude",
             ),
@@ -302,106 +197,54 @@ def _try_conclude_fallback(
             "intent_description": intent.description,
         },
     )
-    conclude_argv = driver.build_conclude(worker, prompt, session)
-    LOG.info("starting conclude fallback project=%s intent=%s worker=%s", project_id, intent.id, worker.name)
+    LOG.info("starting conclude fallback project=%s intent=%s worker=%s", project.project.id, intent.id, session.worker.name)
     conclude_started = time.perf_counter()
-    result = _run_process(
-        container_manager,
-        container_name,
-        worker,
-        conclude_argv,
-        phase="explore_conclude",
-        timeout=config.tasks.explore.conclude_timeout,
-        lease=lease,
-        cancellation=cancellation,
-    )
+    result = session.conclude(prompt, phase="explore_conclude", timeout=config.tasks.explore.conclude_timeout)
     conclude_ms = int((time.perf_counter() - conclude_started) * 1000)
     cancelled = cancel_reason(result, cancellation)
     if cancelled is not None:
-        LOG.info(
-            "conclude cancelled project=%s intent=%s worker=%s reason=%s conclude_ms=%s",
-            project_id,
-            intent.id,
-            worker.name,
-            cancelled,
-            conclude_ms,
-        )
-        best_effort_release(client, project_id, intent.id, worker.name)
+        best_effort_release(client, project.project.id, intent.id, session.worker.name)
         return "cancelled"
     if lease.failure is not None:
-        best_effort_release(client, project_id, intent.id, worker.name)
+        best_effort_release(client, project.project.id, intent.id, session.worker.name)
         return "failed"
     if result.timed_out or result.returncode != 0:
         LOG.warning(
-            "conclude failed project=%s intent=%s worker=%s code=%s timed_out=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",
-            project_id,
+            "conclude failed project=%s intent=%s worker=%s code=%s timed_out=%s conclude_ms=%s stderr_preview=%s",
+            project.project.id,
             intent.id,
-            worker.name,
+            session.worker.name,
             result.returncode,
             result.timed_out,
             conclude_ms,
-            preview(result.stdout),
             preview(result.stderr),
         )
-        best_effort_release(client, project_id, intent.id, worker.name)
+        best_effort_release(client, project.project.id, intent.id, session.worker.name)
         return "failed"
     try:
-        model_output = driver.extract_response_text(result.stdout, result.stderr)
-        payload = parse_json_output(model_output)
+        payload = parse_json_output(session.response_text(result))
         kind, description = validate_explore_payload(payload)
     except Exception as exc:
         LOG.warning(
-            "conclude parse failed project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",
-            project_id,
+            "conclude parse failed project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s",
+            project.project.id,
             intent.id,
-            worker.name,
+            session.worker.name,
             exc,
             conclude_ms,
             preview(result.stdout),
-            preview(result.stderr),
         )
-        best_effort_release(client, project_id, intent.id, worker.name)
+        best_effort_release(client, project.project.id, intent.id, session.worker.name)
         return "failed"
     if kind == "rejected":
-        LOG.warning(
-            "conclude rejected project=%s intent=%s worker=%s conclude_ms=%s stdout_preview=%s",
-            project_id,
-            intent.id,
-            worker.name,
-            conclude_ms,
-            preview(result.stdout),
-        )
-        best_effort_release(client, project_id, intent.id, worker.name)
+        best_effort_release(client, project.project.id, intent.id, session.worker.name)
         return "rejected"
     return write_conclude_result(
         client,
-        project_id,
+        project.project.id,
         intent.id,
-        worker.name,
+        session.worker.name,
         description,
         source="explore_conclude",
         phase_ms=conclude_ms,
-    )
-
-
-def _run_process(
-    container_manager: ContainerManager,
-    container_name: str,
-    worker: WorkerConfig,
-    argv: list[str],
-    *,
-    phase: str,
-    timeout: int,
-    lease: HeartbeatLease,
-    cancellation: TaskCancellation,
-):
-    return run_worker_process(
-        container_manager,
-        container_name,
-        worker,
-        argv,
-        phase=phase,
-        timeout_seconds=timeout,
-        lease=lease,
-        cancellation=cancellation,
     )

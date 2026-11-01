@@ -12,10 +12,16 @@ _db_path: Path | None = None
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS settings (
     intent_timeout INTEGER NOT NULL DEFAULT 15,
-    reason_timeout INTEGER NOT NULL DEFAULT 15
+    reason_timeout INTEGER NOT NULL DEFAULT 15,
+    agent_provider TEXT NOT NULL DEFAULT 'openai',
+    agent_base_url TEXT NOT NULL DEFAULT 'https://api.deepseek.com/v1',
+    agent_model TEXT NOT NULL DEFAULT 'deepseek-chat',
+    agent_api_key TEXT NOT NULL DEFAULT '',
+    agent_context_window INTEGER NOT NULL DEFAULT 1000000,
+    agent_max_tokens INTEGER NOT NULL DEFAULT 16384,
+    agent_temperature REAL NOT NULL DEFAULT 0.6,
+    agent_request_timeout INTEGER NOT NULL DEFAULT 300
 );
-
-INSERT OR IGNORE INTO settings (rowid, intent_timeout, reason_timeout) VALUES (1, 15, 15);
 
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -91,6 +97,37 @@ def configure(path: Path) -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
         _ensure_project_columns(conn)
+        _ensure_settings_columns(conn)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO settings (
+                rowid, intent_timeout, reason_timeout,
+                agent_provider, agent_base_url, agent_model, agent_api_key,
+                agent_context_window, agent_max_tokens, agent_temperature,
+                agent_request_timeout
+            ) VALUES (1, 15, 15, 'openai', 'https://api.deepseek.com/v1', 'deepseek-chat', '',
+                      1000000, 16384, 0.6, 300)
+            """
+        )
+
+
+SETTINGS_COLUMNS: dict[str, str] = {
+    "agent_provider": "TEXT NOT NULL DEFAULT 'openai'",
+    "agent_base_url": "TEXT NOT NULL DEFAULT 'https://api.deepseek.com/v1'",
+    "agent_model": "TEXT NOT NULL DEFAULT 'deepseek-chat'",
+    "agent_api_key": "TEXT NOT NULL DEFAULT ''",
+    "agent_context_window": "INTEGER NOT NULL DEFAULT 1000000",
+    "agent_max_tokens": "INTEGER NOT NULL DEFAULT 16384",
+    "agent_temperature": "REAL NOT NULL DEFAULT 0.6",
+    "agent_request_timeout": "INTEGER NOT NULL DEFAULT 300",
+}
+
+
+def _ensure_settings_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(settings)")}
+    for name, definition in SETTINGS_COLUMNS.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE settings ADD COLUMN {name} {definition}")
 
 
 def _ensure_project_columns(conn: sqlite3.Connection) -> None:

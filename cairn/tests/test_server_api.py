@@ -118,7 +118,11 @@ def test_settings_and_export_are_backed_by_the_same_database(client: TestClient)
 
     response = client.put("/settings", json={"intent_timeout": 30, "reason_timeout": 45})
     assert response.status_code == 200
-    assert client.get("/settings").json() == {"intent_timeout": 30, "reason_timeout": 45}
+    settings = client.get("/settings").json()
+    assert settings["intent_timeout"] == 30
+    assert settings["reason_timeout"] == 45
+    assert settings["api_key_configured"] is False
+    assert settings["agent"]["provider"] == "openai"
 
     exported = client.get(f"/projects/{project_id}/export?format=yaml")
     assert exported.status_code == 200
@@ -207,3 +211,55 @@ def test_project_creation_rejects_invalid_bootstrap_enabled(client: TestClient) 
     )
 
     assert response.status_code == 422
+
+
+def test_agent_settings_mask_key_and_keep_it_when_blank(client: TestClient) -> None:
+    payload = {
+        "intent_timeout": 20,
+        "reason_timeout": 20,
+        "agent": {
+            "provider": "openai",
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat",
+            "api_key": "sk-test-12345678",
+            "context_window": 65536,
+            "max_tokens": 4096,
+            "temperature": 0.5,
+            "request_timeout": 120,
+        },
+    }
+    assert client.put("/settings", json=payload).status_code == 200
+    view = client.get("/settings").json()
+    assert view["agent"]["api_key"] == ""
+    assert view["api_key_configured"] is True
+    assert view["api_key_hint"] == "sk-t...5678"
+    assert client.get("/settings/agent").json()["api_key"] == "sk-test-12345678"
+
+    payload["agent"]["api_key"] = ""
+    assert client.put("/settings", json=payload).status_code == 200
+    assert client.get("/settings/agent").json()["api_key"] == "sk-test-12345678"
+
+
+def test_changing_base_url_with_blank_key_is_rejected(client: TestClient) -> None:
+    payload = {
+        "intent_timeout": 20,
+        "reason_timeout": 20,
+        "agent": {
+            "provider": "openai",
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat",
+            "api_key": "sk-test-12345678",
+            "context_window": 65536,
+            "max_tokens": 4096,
+            "temperature": 0.5,
+            "request_timeout": 120,
+        },
+    }
+    assert client.put("/settings", json=payload).status_code == 200
+
+    payload["agent"]["base_url"] = "https://evil.example/v1"
+    payload["agent"]["api_key"] = ""
+    response = client.put("/settings", json=payload)
+    assert response.status_code == 400
+    assert "new API Key" in response.json()["detail"]
+    assert client.get("/settings/agent").json()["api_key"] == "sk-test-12345678"

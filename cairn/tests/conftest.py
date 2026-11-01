@@ -3,9 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from cairn.dispatcher.config import DispatchConfig
-from cairn.dispatcher.protocol.client import ApiResult
-from cairn.dispatcher.workers.base import DriverResult
-from cairn.dispatcher.workers.health import HealthResult
 from cairn.server.models import Fact, Hint, Intent, ProjectDetail, ProjectMeta
 
 
@@ -25,11 +22,6 @@ def make_config() -> DispatchConfig:
                 "bootstrap": {"timeout": 10, "conclude_timeout": 5},
                 "reason": {"timeout": 10, "max_intents": 3},
                 "explore": {"timeout": 10, "conclude_timeout": 5},
-            },
-            "container": {
-                "image": "test-image",
-                "network_mode": "host",
-                "completed_action": "stop",
             },
             "workers": [
                 {

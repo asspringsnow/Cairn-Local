@@ -1,88 +1,54 @@
-# Cairn server API endpoint.
-server: "http://cairn-server:8000"
+# Cairn 单机部署配置示例。
+#
+# 模型 / Base URL / API Key 不写在这里：启动后在 Web UI 的
+# 「服务器设置 -> Agent 模型」里配置，保存后 dispatcher 下一轮任务自动生效。
+#
+# 复制为 dispatch.yaml 后按需修改：
+#   cp dispatch.example.yaml dispatch.yaml
 
-# Shared environment variables merged into every worker.
-common_env:
-  TSEC_SERVER_HOST: "<SERVER_HOST>:8000"
-  TSEC_AGENT_TOKEN: "xxx"
+server: "http://127.0.0.1:8000"
 
 runtime:
-  # Scheduler tick interval in seconds.
+  # 调度轮询与心跳周期（秒）。
   interval: 3
-  # Global concurrency cap across all workers and all projects.
+  # 全局并发任务上限。
   max_workers: 8
-  # Maximum number of projects that may be actively scheduled at the same time.
+  # 同时调度的项目数上限。
   max_running_projects: 3
-  # Per-project worker cap. Prevents one project from monopolizing the whole dispatcher.
+  # 单项目并发任务上限。
   max_project_workers: 4
-  # Timeout for each enabled worker healthcheck.
-  healthcheck_timeout: 20
-  # "startup_and_task" checks at dispatcher startup and before every task.
-  # "startup_only" checks only at startup. "disabled" skips automatic worker checks.
+  # 启动时模型连通性检查的超时（秒）。
+  healthcheck_timeout: 30
+  # startup_only：启动时检查一次；startup_and_task：每个任务前也检查；
+  # disabled：不自动检查。
   worker_healthcheck: "startup_only"
-  # Prompt set loaded from cairn/src/cairn/dispatcher/prompts/.
+  # prompt 组，随包分发在 cairn/src/cairn/dispatcher/prompts/ 下。
   prompt_group: "default"
+  # 每个项目的工作目录根。相对路径相对于 dispatcher 启动目录。
+  workspace_root: "./workspaces"
+  # 项目完成后保留工作目录（keep）或删除（remove）。
+  completed_action: "keep"
 
 tasks:
   bootstrap:
-    # Main execution timeout for the initial direct solve attempt.
-    timeout: 300
-    # Time budget for conclude fallback after the main phase times out or returns unusable output.
-    conclude_timeout: 90
+    # 初始阶段直接尝试解决问题的超时（秒）。
+    timeout: 600
+    # 主阶段超时/解析失败后，同一 session 收尾写 Fact 的超时。
+    conclude_timeout: 180
   reason:
-    # Reason decides whether the goal is met and whether new intents should be proposed.
     timeout: 300
-    # Hard cap on how many new intents one reason step may create.
-    max_intents: 2
+    # 一次 reason 最多声明多少个新 Intent。
+    max_intents: 3
   explore:
-    # Main execution timeout for exploring a claimed intent.
-    timeout: 300
-    # Time budget for conclude fallback used to summarize confirmed findings from the same session.
-    conclude_timeout: 90
+    timeout: 900
+    conclude_timeout: 180
 
-container:
-  # Base worker container. The dispatcher execs agent commands inside one container per project.
-  image: "ghcr.io/oritera/cairn-worker-container:latest"
-  network_mode: "host"
-  # "stop" keeps finished containers for inspection; "remove" is cleaner but loses post-run state.
-  completed_action: "stop"
-  # Add Linux capabilities only when a task truly needs them, such as packet crafting or network admin actions.
-  # cap_add:
-  #   - "NET_RAW"
-  #   - "NET_ADMIN"
-
-
+# 可选。省略时自动创建一个 native worker：
+#   name=cairn, task_types=[bootstrap, reason, explore], max_running=max_workers
+# 只有一个 native worker，因为模型配置是全局一份。
 workers:
-  # Worker priority is ascending: lower numbers are preferred first.
-  # max_running is per-worker concurrency. Slower backends such as Pi usually benefit from lower values.
-  - name: "claudecode_deepseek-v4-pro"
-    type: "claudecode"
+  - name: "cairn"
+    type: "native"
     task_types: [bootstrap, reason, explore]
-    max_running: 2
+    max_running: 8
     priority: 0
-    env:
-      ANTHROPIC_MODEL: "deepseek-v4-pro"
-      ANTHROPIC_BASE_URL: "https://api.deepseek.com/anthropic"
-      ANTHROPIC_AUTH_TOKEN: "sk-xxx"
-
-  # - name: "codex_qwen3.6-plus"
-  #   type: "codex"
-  #   task_types: [bootstrap,reason,explore]
-  #   max_running: 2
-  #   priority: 0
-  #   env:
-  #     CODEX_MODEL: "qwen3.6-plus"
-  #     CODEX_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  #     OPENAI_API_KEY: "sk-xxx"
-
-  # - name: "pi_qwen3.6-plus"
-  #   type: "pi"
-  #   task_types: [bootstrap,reason,explore]
-  #   max_running: 2
-  #   priority: 0
-  #   env:
-  #     PI_MODEL: "qwen3.6-plus"
-  #     PI_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  #     PI_API_KEY: "sk-xxx"
-  #     PI_PROVIDER_API: "openai-completions"
-  #     PI_MODEL_CONTEXT_WINDOW: "262144"
