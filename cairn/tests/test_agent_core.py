@@ -6,7 +6,7 @@ import time
 
 from cairn.agent.context import compact_trigger_tokens, estimate_messages_tokens, should_compact
 from cairn.agent.messages import assistant_message, system_message, tool_message, to_anthropic, to_openai, user_message
-from cairn.agent.providers import AnthropicClient, OpenAIClient, anthropic_url, openai_url, parse_anthropic_sse, parse_openai_sse
+from cairn.agent.providers import AnthropicClient, ModelResponse, OpenAIClient, anthropic_url, openai_url, parse_anthropic_sse, parse_openai_sse
 from cairn.agent.loop import AgentLoop
 from cairn.agent.session import SessionState, SessionStore
 from cairn.agent.settings import AgentSettings
@@ -248,3 +248,39 @@ def test_sequential_tool_timeout_backfills_tool_results(tmp_path) -> None:
     results = [message for message in session.messages if message.get("role") == "tool"]
     assert [message["tool_call_id"] for message in results] == ["c1", "c2"]
     assert all(message["is_error"] for message in results)
+
+
+class _ToolCaptureClient:
+    def __init__(self) -> None:
+        self.names: list[str] = []
+
+    def chat(self, messages, tools, **kwargs):
+        self.names = [tool["name"] for tool in tools]
+        return ModelResponse(text="done")
+
+
+def test_reason_tool_allowlist_filters_and_rejects(tmp_path) -> None:
+    settings = AgentSettings(api_key="x", model="m", base_url="http://x")
+    client = _ToolCaptureClient()
+    loop = AgentLoop(
+        settings,
+        client,
+        Toolbox(tmp_path),
+        SessionState("sys"),
+        SessionStore(tmp_path / "session.json"),
+        lambda _event: None,
+        threading.Event(),
+    )
+
+    loop._call_model(
+        [{"role": "user", "content": "x"}],
+        tools_enabled=True,
+        allowed_tools={"read", "grep", "find", "ls"},
+        deadline=None,
+    )
+    assert sorted(client.names) == ["find", "grep", "ls", "read"]
+
+    loop._allowed_tools = {"read", "grep", "find", "ls"}
+    result = loop._execute_tool({"name": "bash", "arguments": {"command": "id"}}, None)
+    assert result.is_error
+    assert "not allowed" in result.content

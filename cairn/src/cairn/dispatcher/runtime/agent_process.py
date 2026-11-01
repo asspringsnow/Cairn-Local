@@ -181,18 +181,26 @@ class AgentProcess:
         prompt: str,
         *,
         tools_enabled: bool,
+        allowed_tools: set[str] | None = None,
         timeout: int,
         phase: str,
     ) -> AgentProcessResult:
         if self._cancelled:
             return AgentProcessResult(cancelled=True, kind="cancelled", error=self._cancel_reason or "cancelled")
-        LOG.debug("agent run phase=%s tools=%s timeout=%ss", phase, tools_enabled, timeout)
+        LOG.debug("agent run phase=%s tools=%s allowed=%s timeout=%ss", phase, tools_enabled, allowed_tools, timeout)
         try:
             self.start()
         except Exception as exc:
             return AgentProcessResult(error=str(exc), kind="internal", returncode=1)
         reply = self._request(
-            {"op": "run", "prompt": prompt, "tools": tools_enabled, "timeout": timeout, "phase": phase},
+            {
+                "op": "run",
+                "prompt": prompt,
+                "tools": tools_enabled,
+                "allowed_tools": sorted(allowed_tools) if allowed_tools is not None else None,
+                "timeout": timeout,
+                "phase": phase,
+            },
             timeout=timeout + 15,
             terminal={"result", "error"},
         )

@@ -130,11 +130,18 @@ def main() -> int:
             _cancel.clear()
             prompt = str(request.get("prompt") or "")
             tools_enabled = bool(request.get("tools", True))
+            allowed_raw = request.get("allowed_tools")
+            allowed_tools = {str(name) for name in allowed_raw} if isinstance(allowed_raw, list) else None
             timeout = request.get("timeout")
             timeout_value = int(timeout) if timeout else None
             loop = AgentLoop(settings, client, toolbox, session, store, event_sink, _cancel)
             try:
-                text = loop.run(prompt, tools_enabled=tools_enabled, timeout=timeout_value)
+                text = loop.run(
+                    prompt,
+                    tools_enabled=tools_enabled,
+                    allowed_tools=allowed_tools,
+                    timeout=timeout_value,
+                )
                 emit(
                     {
                         "type": "result",

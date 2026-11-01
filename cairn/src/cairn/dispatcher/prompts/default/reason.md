@@ -37,6 +37,7 @@ If Goal has not been satisfied and no new intent should currently be proposed, r
 - Each Intent should be a high-value exploration direction. It does not need to be overly detailed. Focus on the core insight and a clear direction. Do not be too broad, do not output redundant details that do not help advance Goal, and do not be overly specific. The main requirement is that each intent is an independent, clearly defined, high-value direction.
 - An Intent may originate from multiple facts.
 - Different intents should cover different exploration dimensions and avoid duplication or heavy overlap.
+- This is a graph-level decision phase. You may use read/grep/find/ls to verify existing evidence, but do not run bash, modify files, or actively probe the target. If execution or probing is needed, propose an Intent for explore.
 
 ## Context
 ### Graph

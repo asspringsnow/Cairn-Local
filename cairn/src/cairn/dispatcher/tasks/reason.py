@@ -80,7 +80,13 @@ def run_reason_task(
         )
 
         execute_started = time.perf_counter()
-        result = session.run(prompt, phase="reason_execute", timeout=config.tasks.reason.timeout, tools=True)
+        result = session.run(
+            prompt,
+            phase="reason_execute",
+            timeout=config.tasks.reason.timeout,
+            tools=True,
+            allowed_tools={"read", "grep", "find", "ls"},
+        )
         execute_ms = int((time.perf_counter() - execute_started) * 1000)
         total_ms = int((time.perf_counter() - task_started) * 1000)
         cancelled = cancel_reason(result, cancellation)

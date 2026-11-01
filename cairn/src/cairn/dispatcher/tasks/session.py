@@ -99,9 +99,9 @@ class WorkerSession:
         except Exception as exc:
             return HealthResult(ok=False, status=None, detail=str(exc)[:200])
 
-    def run(self, prompt: str, *, phase: str, timeout: int, tools: bool = True) -> ProcessResult:
+    def run(self, prompt: str, *, phase: str, timeout: int, tools: bool = True, allowed_tools: set[str] | None = None) -> ProcessResult:
         if self._native:
-            return self._run_native(prompt, phase=phase, timeout=timeout, tools=tools)
+            return self._run_native(prompt, phase=phase, timeout=timeout, tools=tools, allowed_tools=allowed_tools)
         return self._run_mock(prompt, phase=phase, timeout=timeout, tools=tools)
 
     def conclude(self, prompt: str, *, phase: str, timeout: int) -> ProcessResult:
@@ -138,9 +138,17 @@ class WorkerSession:
             self._attach(self._agent)
         return self._agent
 
-    def _run_native(self, prompt: str, *, phase: str, timeout: int, tools: bool) -> ProcessResult:
+    def _run_native(
+        self,
+        prompt: str,
+        *,
+        phase: str,
+        timeout: int,
+        tools: bool,
+        allowed_tools: set[str] | None = None,
+    ) -> ProcessResult:
         agent = self._ensure_agent()
-        result = agent.run(prompt, tools_enabled=tools, timeout=timeout, phase=phase)
+        result = agent.run(prompt, tools_enabled=tools, allowed_tools=allowed_tools, timeout=timeout, phase=phase)
         return ProcessResult(
             returncode=result.returncode,
             stdout=result.text,

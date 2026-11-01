@@ -49,6 +49,7 @@ class AgentLoop:
         self.emit = event_sink
         self.cancel_event = cancel_event
         self._last_prompt_tokens = 0
+        self._allowed_tools: set[str] | None = None
 
     def _check(self, deadline: float | None) -> None:
         if self.cancel_event.is_set():
@@ -67,10 +68,15 @@ class AgentLoop:
         messages: list[dict[str, Any]],
         *,
         tools_enabled: bool,
+        allowed_tools: set[str] | None,
         deadline: float | None,
     ) -> ModelResponse:
         self._check(deadline)
-        available = self.toolbox.specs() if tools_enabled else []
+        available = [
+            spec
+            for spec in self.toolbox.specs()
+            if tools_enabled and (allowed_tools is None or spec["name"] in allowed_tools)
+        ]
         timeout = self.settings.request_timeout
         if deadline is not None:
             timeout = max(5, min(timeout, int(deadline - time.monotonic())))
@@ -93,8 +99,10 @@ class AgentLoop:
         prompt: str,
         *,
         tools_enabled: bool = True,
+        allowed_tools: set[str] | None = None,
         timeout: int | None = None,
     ) -> str:
+        self._allowed_tools = set(allowed_tools) if allowed_tools is not None else None
         self.session.messages.append(user_message(prompt))
         self._save()
         deadline = time.monotonic() + timeout if timeout else None
@@ -112,7 +120,7 @@ class AgentLoop:
                 messages = self._message_list()
 
             self.emit({"type": "step", "step": step})
-            response = self._call_model(messages, tools_enabled=tools_enabled, deadline=deadline)
+            response = self._call_model(messages, tools_enabled=tools_enabled, allowed_tools=allowed_tools, deadline=deadline)
             self.session.steps += 1
             self.session.record_usage(response.usage)
             self._last_prompt_tokens = int(response.usage.get("prompt_tokens") or 0)
@@ -146,6 +154,8 @@ class AgentLoop:
 
     def _execute_tool(self, call: dict[str, Any], deadline: float | None) -> ToolResult:
         name = str(call.get("name") or "")
+        if self._allowed_tools is not None and name not in self._allowed_tools:
+            return ToolResult(f"ERROR: tool '{name}' is not allowed in this phase", is_error=True)
         arguments = call.get("arguments")
         if not isinstance(arguments, dict):
             return ToolResult("ERROR: tool arguments must be an object", is_error=True)
