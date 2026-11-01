@@ -94,8 +94,8 @@ def main() -> int:
     workspace = Path(str(init.get("workspace") or ".")).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     session_path = Path(str(init.get("session_path") or workspace / ".cairn" / "session.json")).expanduser()
-    system_prompt = str(init.get("system_prompt") or build_system_prompt(str(workspace)))
     phase = str(init.get("phase") or "task")
+    system_prompt = str(init.get("system_prompt") or build_system_prompt(str(workspace), phase=phase))
 
     store = SessionStore(session_path)
     session = store.load(system_prompt)

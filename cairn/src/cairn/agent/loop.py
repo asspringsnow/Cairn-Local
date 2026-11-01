@@ -102,7 +102,10 @@ class AgentLoop:
         allowed_tools: set[str] | None = None,
         timeout: int | None = None,
     ) -> str:
-        self._allowed_tools = set(allowed_tools) if allowed_tools is not None else None
+        if tools_enabled:
+            self._allowed_tools = set(allowed_tools) if allowed_tools is not None else None
+        else:
+            self._allowed_tools = set()
         self.session.messages.append(user_message(prompt))
         self._save()
         deadline = time.monotonic() + timeout if timeout else None

@@ -6,6 +6,7 @@ import time
 
 from cairn.agent.context import compact_trigger_tokens, estimate_messages_tokens, should_compact
 from cairn.agent.messages import assistant_message, system_message, tool_message, to_anthropic, to_openai, user_message
+from cairn.agent.prompt import build_system_prompt
 from cairn.agent.providers import AnthropicClient, ModelResponse, OpenAIClient, anthropic_url, openai_url, parse_anthropic_sse, parse_openai_sse
 from cairn.agent.loop import AgentLoop
 from cairn.agent.session import SessionState, SessionStore
@@ -284,3 +285,12 @@ def test_reason_tool_allowlist_filters_and_rejects(tmp_path) -> None:
     result = loop._execute_tool({"name": "bash", "arguments": {"command": "id"}}, None)
     assert result.is_error
     assert "not allowed" in result.content
+
+
+def test_reason_system_prompt_is_graph_only() -> None:
+    reason_prompt = build_system_prompt("/tmp/ws", phase="reason")
+    assert "Do not call tools" in reason_prompt
+    assert "do not inspect the project workspace" in reason_prompt
+    default_prompt = build_system_prompt("/tmp/ws")
+    assert "bootstrap and explore" in default_prompt
+    assert "read the graph and the workspace" not in default_prompt

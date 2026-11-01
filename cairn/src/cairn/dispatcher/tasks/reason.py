@@ -65,14 +65,14 @@ def run_reason_task(
             if intent.to is None
         ]
         allowed_fact_ids = [fact.id for fact in project.facts if fact.id != "goal"]
+        graph_yaml = export_yaml.strip()
+        # Keep a debug snapshot for inspection, but inline the graph into the
+        # reason prompt: reason has no tools and must not read the workspace.
+        write_graph_snapshot_reference(session.workspace_path, graph_yaml, phase="reason_execute")
         prompt = render_prompt(
             load_prompt(config.runtime.prompt_group, "reason.md"),
             {
-                "graph_yaml": write_graph_snapshot_reference(
-                    session.workspace_path,
-                    export_yaml.strip(),
-                    phase="reason_execute",
-                ),
+                "graph_yaml": graph_yaml,
                 "fact_ids": format_fact_ids(allowed_fact_ids),
                 "open_intents": format_open_intents(open_intents),
                 "max_intents": str(config.tasks.reason.max_intents),
@@ -84,8 +84,7 @@ def run_reason_task(
             prompt,
             phase="reason_execute",
             timeout=config.tasks.reason.timeout,
-            tools=True,
-            allowed_tools={"read", "grep", "find", "ls"},
+            tools=False,
         )
         execute_ms = int((time.perf_counter() - execute_started) * 1000)
         total_ms = int((time.perf_counter() - task_started) * 1000)

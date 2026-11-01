@@ -119,7 +119,7 @@ class AgentProcess:
             "settings": self.settings.model_dump(),
             "workspace": str(self.workspace),
             "session_path": str(self.session_path),
-            "system_prompt": build_system_prompt(str(self.workspace)),
+            "system_prompt": build_system_prompt(str(self.workspace), phase=self.phase),
             "phase": self.phase,
         }
         reply = self._request(init, timeout=READY_TIMEOUT_SECONDS, terminal={"ready"})
