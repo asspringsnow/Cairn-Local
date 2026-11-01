@@ -255,17 +255,17 @@ server: "http://127.0.0.1:8000"
 runtime:
   interval: 3
   max_workers: 8
-  max_running_projects: 3
+  max_running_projects: 5
   max_project_workers: 4
-  healthcheck_timeout: 30
+  healthcheck_timeout: 15
   worker_healthcheck: "startup_only"   # startup_only | startup_and_task | disabled
   prompt_group: "default"
   workspace_root: "./workspaces"
   completed_action: "keep"             # keep | remove
 tasks:
-  bootstrap: {timeout: 600, conclude_timeout: 180}
+  bootstrap: {timeout: 120, conclude_timeout: 30}
   reason: {timeout: 300, max_intents: 3}
-  explore: {timeout: 900, conclude_timeout: 180}
+  explore: {timeout: 600, conclude_timeout: 120}
 # workers 可省略，默认一个 native worker
 ```
 

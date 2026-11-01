@@ -14,11 +14,11 @@ runtime:
   # 全局并发任务上限。
   max_workers: 8
   # 同时调度的项目数上限。
-  max_running_projects: 3
+  max_running_projects: 5
   # 单项目并发任务上限。
   max_project_workers: 4
   # 启动时模型连通性检查的超时（秒）。
-  healthcheck_timeout: 30
+  healthcheck_timeout: 15
   # startup_only：启动时检查一次；startup_and_task：每个任务前也检查；
   # disabled：不自动检查。
   worker_healthcheck: "startup_only"
@@ -32,16 +32,16 @@ runtime:
 tasks:
   bootstrap:
     # 初始阶段直接尝试解决问题的超时（秒）。
-    timeout: 600
+    timeout: 120
     # 主阶段超时/解析失败后，同一 session 收尾写 Fact 的超时。
-    conclude_timeout: 180
+    conclude_timeout: 30
   reason:
     timeout: 300
     # 一次 reason 最多声明多少个新 Intent。
     max_intents: 3
   explore:
-    timeout: 900
-    conclude_timeout: 180
+    timeout: 600
+    conclude_timeout: 120
 
 # 可选。省略时自动创建一个 native worker：
 #   name=cairn, task_types=[bootstrap, reason, explore], max_running=max_workers
