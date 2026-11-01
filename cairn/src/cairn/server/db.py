@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS settings (
     agent_model TEXT NOT NULL DEFAULT 'deepseek-chat',
     agent_api_key TEXT NOT NULL DEFAULT '',
     agent_context_window INTEGER NOT NULL DEFAULT 1000000,
-    agent_max_tokens INTEGER NOT NULL DEFAULT 16384,
+    agent_max_tokens INTEGER NOT NULL DEFAULT 32768,
     agent_temperature REAL NOT NULL DEFAULT 0.6,
     agent_request_timeout INTEGER NOT NULL DEFAULT 300
 );
@@ -106,7 +106,7 @@ def configure(path: Path) -> None:
                 agent_context_window, agent_max_tokens, agent_temperature,
                 agent_request_timeout
             ) VALUES (1, 15, 15, 'openai', 'https://api.deepseek.com/v1', 'deepseek-chat', '',
-                      1000000, 16384, 0.6, 300)
+                      1000000, 32768, 0.6, 300)
             """
         )
 
@@ -117,7 +117,7 @@ SETTINGS_COLUMNS: dict[str, str] = {
     "agent_model": "TEXT NOT NULL DEFAULT 'deepseek-chat'",
     "agent_api_key": "TEXT NOT NULL DEFAULT ''",
     "agent_context_window": "INTEGER NOT NULL DEFAULT 1000000",
-    "agent_max_tokens": "INTEGER NOT NULL DEFAULT 16384",
+    "agent_max_tokens": "INTEGER NOT NULL DEFAULT 32768",
     "agent_temperature": "REAL NOT NULL DEFAULT 0.6",
     "agent_request_timeout": "INTEGER NOT NULL DEFAULT 300",
 }

@@ -180,7 +180,16 @@ class DispatcherLoop:
 
     @staticmethod
     def _signature(settings: AgentSettings) -> tuple[object, ...]:
-        return (settings.provider, settings.base_url, settings.model, bool(settings.api_key))
+        return (
+            settings.provider,
+            settings.base_url,
+            settings.model,
+            bool(settings.api_key),
+            settings.context_window,
+            settings.max_tokens,
+            settings.temperature,
+            settings.request_timeout,
+        )
 
     def _refresh_agent_settings(self) -> None:
         try:

@@ -17,7 +17,7 @@ class AgentSettings(BaseModel):
     model: str = "deepseek-chat"
     api_key: str = ""
     context_window: int = Field(default=1_000_000, ge=4096)
-    max_tokens: int = Field(default=16384, ge=256)
+    max_tokens: int = Field(default=32768, ge=256)
     temperature: float = Field(default=0.6, ge=0.0, le=2.0)
     request_timeout: int = Field(default=300, ge=5, le=3600)
 

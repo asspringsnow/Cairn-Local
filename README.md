@@ -41,7 +41,7 @@ Cairn 不再依赖任何外部 agent CLI，也不再需要 Docker：
 
 ### 上下文长度与输出上限
 
-默认 `context_window = 1,000,000`（pi 的 DeepSeek catalog 数据），`max_tokens = 16384`（pi 的 `model-config.ts` / `provider-composer.ts` 默认最大输出）。DeepSeek catalog 里的 `maxTokens: 384000` 是模型能力上限，不是 pi 的默认请求值；直接拿它当默认可能被服务端以 400 拒绝。请按你实际使用的模型填写这两个值。
+默认 `context_window = 1,000,000`，`max_tokens = 32768`。DeepSeek 的 reasoning 会消耗输出预算，16384 可能被 reasoning 吃满，导致最终 JSON 为空；32768 给最终答案留出空间。DeepSeek catalog 里的 `maxTokens: 384000` 是模型能力上限，不是默认请求值；如果服务端拒绝更大的输出值，请在 UI 里调低。
 
 内置 agent **不设置硬性的最大步数**，和 pi 的行为一致。任务由 dispatcher 的 phase timeout、项目停止、以及人工 Hint 控制；如果模型卡住，停止项目或注入 Hint 即可，不会由 agent 自己截断轮次。
 

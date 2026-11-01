@@ -125,7 +125,7 @@ def test_agent_settings_mask_and_token_estimate() -> None:
 def test_agent_default_context_and_output_follow_pi() -> None:
     settings = AgentSettings(api_key="x", model="deepseek-flash", base_url="https://api.deepseek.com/v1")
     assert settings.context_window == 1_000_000
-    assert settings.max_tokens == 16_384
+    assert settings.max_tokens == 32_768
 
 
 def test_openai_stream_parses_text_tool_deltas_and_usage() -> None:

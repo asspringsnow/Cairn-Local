@@ -92,4 +92,4 @@ def test_configure_migrates_legacy_settings_table_before_seeding_agent_columns(t
     assert row["agent_base_url"] == "https://api.deepseek.com/v1"
     assert row["agent_model"] == "deepseek-chat"
     assert row["agent_context_window"] == 1000000
-    assert row["agent_max_tokens"] == 16384
+    assert row["agent_max_tokens"] == 32768

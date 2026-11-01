@@ -1206,7 +1206,7 @@ function cairnApp() {
       api_key: '',
       clear_api_key: false,
       context_window: 1000000,
-      max_tokens: 16384,
+      max_tokens: 32768,
       temperature: 0.6,
       request_timeout: 300,
     },
@@ -1690,7 +1690,7 @@ function cairnApp() {
           api_key: '',
           clear_api_key: false,
           context_window: a.context_window || 1000000,
-          max_tokens: a.max_tokens || 16384,
+          max_tokens: a.max_tokens || 32768,
           temperature: a.temperature ?? 0.6,
           request_timeout: a.request_timeout || 300,
         };
