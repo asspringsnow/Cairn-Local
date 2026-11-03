@@ -130,12 +130,14 @@ execute 和 conclude 复用同一个 session；主阶段超时或输出无法解
 
 `read` 除了文本文件，也支持图片：
 
-- png / jpg / jpeg / gif / webp
-- 单张最大 3MB（跨 Anthropic/OpenAI 的安全值；base64 会膨胀）
+- png / jpg / jpeg / gif / webp / bmp
+- 按文件内容嗅探 MIME，不依赖扩展名（错误扩展名也能识别）
+- 原始文件最大 20MB；自动缩放到最长边 2048，并压缩到 ≤3MB 的 provider 安全大小
+- BMP 会自动转成 PNG/JPEG 后发送
 - 图片会作为 image content block 附在 tool result 上，不是 base64 文本
 - 需要模型本身支持 vision；纯文本模型可能返回 400，请换 vision 模型或不要读取图片
 - `offset` / `limit` 只适用于文本文件
-- 图片太大时先用 `bash` 压缩/缩放再 `read`
+- 图片太大时仍可先用 `bash` 压缩/缩放，减少 token 和延迟
 
 ---
 

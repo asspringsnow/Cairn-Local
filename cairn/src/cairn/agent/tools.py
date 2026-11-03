@@ -12,6 +12,7 @@ import base64
 import codecs
 import difflib
 import fnmatch
+import io
 import json
 import os
 import re
@@ -25,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from PIL import Image, ImageOps, UnidentifiedImageError
+
 
 MAX_OUTPUT_BYTES = 50 * 1024
 MAX_OUTPUT_LINES = 2000
@@ -32,14 +35,11 @@ MAX_READ_BYTES = 50 * 1024
 MAX_READ_LINES = 2000
 MAX_GREP_LINE = 500
 MAX_WRITE_BYTES = 5 * 1024 * 1024
-MAX_IMAGE_BYTES = 3 * 1024 * 1024
-IMAGE_MIME_BY_SUFFIX = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-}
+MAX_IMAGE_INPUT_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_OUTPUT_BYTES = 3 * 1024 * 1024
+MAX_IMAGE_DIMENSION = 2048
+IMAGE_FORMATS = {"PNG", "JPEG", "GIF", "WEBP", "BMP"}
+Image.MAX_IMAGE_PIXELS = 50_000_000
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".cairn", "venv", "dist", "build"}
 
 
@@ -94,6 +94,107 @@ def _truncate_tail(text: str, max_bytes: int = MAX_OUTPUT_BYTES, max_lines: int 
         result = encoded[-max_bytes:].decode("utf-8", "ignore")
         truncated = True
     return result, truncated
+
+
+def _detect_image_mime(probe: bytes) -> str | None:
+    if probe.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if probe.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if probe.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(probe) >= 12 and probe[:4] == b"RIFF" and probe[8:12] == b"WEBP":
+        return "image/webp"
+    if probe.startswith(b"BM"):
+        return "image/bmp"
+    return None
+
+
+def _has_alpha(image: Image.Image) -> bool:
+    return image.mode in ("RGBA", "LA") or "transparency" in image.info
+
+
+def _flatten_image(image: Image.Image) -> Image.Image:
+    if _has_alpha(image):
+        rgba = image.convert("RGBA")
+        canvas = Image.new("RGB", rgba.size, (255, 255, 255))
+        canvas.paste(rgba, mask=rgba.getchannel("A"))
+        return canvas
+    return image.convert("RGB")
+
+
+def _encode_image(image: Image.Image, format_name: str, quality: int = 88) -> bytes:
+    buffer = io.BytesIO()
+    if format_name == "JPEG":
+        image.save(buffer, "JPEG", quality=quality, optimize=True)
+    else:
+        image.save(buffer, "PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def _image_result(
+    path: Path,
+    mime: str,
+    encoded: bytes,
+    image: Image.Image,
+    original_mime: str,
+    original_width: int,
+    original_height: int,
+) -> dict[str, Any]:
+    return {
+        "mime": mime,
+        "data": base64.b64encode(encoded).decode("ascii"),
+        "path": str(path),
+        "bytes": len(encoded),
+        "width": image.width,
+        "height": image.height,
+        "original_mime": original_mime,
+        "original_width": original_width,
+        "original_height": original_height,
+        "resized": image.width != original_width or image.height != original_height,
+    }
+
+
+def _process_image(data: bytes, path: Path, original_mime: str) -> dict[str, Any]:
+    try:
+        with Image.open(io.BytesIO(data)) as opened:
+            source_format = str(opened.format or "").upper()
+            if source_format not in IMAGE_FORMATS:
+                raise ValueError(f"unsupported image format: {source_format or 'unknown'}")
+            image = ImageOps.exif_transpose(opened)
+            if getattr(image, "is_animated", False):
+                try:
+                    image.seek(0)
+                except EOFError:
+                    pass
+            original_width, original_height = image.size
+            if max(original_width, original_height) > MAX_IMAGE_DIMENSION:
+                image.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.Resampling.LANCZOS)
+            preferred = "JPEG" if source_format == "JPEG" else "PNG"
+
+            for scale in (1.0, 0.8, 0.6, 0.45):
+                if scale == 1.0:
+                    candidate = image
+                else:
+                    candidate = image.resize(
+                        (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+                        Image.Resampling.LANCZOS,
+                    )
+                if preferred == "PNG":
+                    png = candidate if candidate.mode in ("RGB", "RGBA") else candidate.convert(
+                        "RGBA" if _has_alpha(candidate) else "RGB"
+                    )
+                    encoded = _encode_image(png, "PNG")
+                    if len(encoded) <= MAX_IMAGE_OUTPUT_BYTES:
+                        return _image_result(path, "image/png", encoded, png, original_mime, original_width, original_height)
+                flat = _flatten_image(candidate)
+                for quality in (88, 75, 60):
+                    encoded = _encode_image(flat, "JPEG", quality)
+                    if len(encoded) <= MAX_IMAGE_OUTPUT_BYTES:
+                        return _image_result(path, "image/jpeg", encoded, flat, original_mime, original_width, original_height)
+            raise ValueError("image is still too large after resizing")
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+        raise ValueError(f"cannot process image: {exc}") from exc
 
 
 class Toolbox:
@@ -301,8 +402,9 @@ class Toolbox:
             name="read",
             description=(
                 "Read a file. Text files return at most 2000 lines / 50KB per call; use offset "
-                "(1-indexed) and limit for large files. Image files (png/jpg/jpeg/gif/webp) are "
-                "returned as image attachments to the model. offset/limit are only for text files."
+                "(1-indexed) and limit for large files. Image files (png/jpg/jpeg/gif/webp/bmp) are "
+                "MIME-detected from content, auto-resized/compressed, and returned as image attachments; "
+                "original image max 20MB, output max 3MB. offset/limit are only for text files."
             ),
             parameters=_obj(
                 {
@@ -326,25 +428,31 @@ class Toolbox:
         if not path.is_file():
             return _error(f"not a file: {path}")
 
-        mime = IMAGE_MIME_BY_SUFFIX.get(path.suffix.lower())
+        with path.open("rb") as handle:
+            probe = handle.read(8192)
+        mime = _detect_image_mime(probe)
         if mime:
             if args.get("offset") is not None or args.get("limit") is not None:
                 return _error("image read does not support offset/limit")
             size = path.stat().st_size
-            if size > MAX_IMAGE_BYTES:
-                return _error(f"image is too large ({size} bytes; max {MAX_IMAGE_BYTES})")
-            data = base64.b64encode(path.read_bytes()).decode("ascii")
-            return ToolResult(
-                f"Image: {path} ({mime}, {size} bytes). Attached as an image content block.",
-                images=[{"mime": mime, "data": data, "path": str(path), "bytes": size}],
+            if size > MAX_IMAGE_INPUT_BYTES:
+                return _error(f"image is too large ({size} bytes; max {MAX_IMAGE_INPUT_BYTES})")
+            try:
+                image_data = _process_image(path.read_bytes(), path, mime)
+            except ValueError as exc:
+                return _error(str(exc))
+            content = (
+                f"Image: {path} ({image_data['mime']}, "
+                f"{image_data['width']}x{image_data['height']}, {image_data['bytes']} bytes; "
+                f"original {mime}, {image_data['original_width']}x{image_data['original_height']}"
+                f"{' resized' if image_data['resized'] else ''}). Attached as an image content block."
             )
+            return ToolResult(content, images=[image_data])
 
         offset = _as_int(args.get("offset"), 1, 1, 10_000_000)
         limit = args.get("limit")
         limit = _as_int(limit, MAX_READ_LINES, 1, MAX_READ_LINES) if limit is not None else None
 
-        with path.open("rb") as handle:
-            probe = handle.read(8192)
         if b"\x00" in probe:
             return _error(f"binary file ({path.stat().st_size} bytes): use bash tools to inspect it")
 

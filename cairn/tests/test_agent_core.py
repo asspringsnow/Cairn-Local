@@ -4,6 +4,8 @@ import json
 import threading
 import time
 
+from PIL import Image
+
 from cairn.agent.context import compact_trigger_tokens, estimate_messages_tokens, should_compact
 from cairn.agent.messages import assistant_message, system_message, tool_message, to_anthropic, to_openai, user_message
 from cairn.agent.prompt import build_system_prompt
@@ -298,7 +300,7 @@ def test_reason_system_prompt_is_graph_only() -> None:
 
 def test_read_image_returns_attachment(tmp_path) -> None:
     image = tmp_path / "pixel.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\nnot-a-real-png")
+    Image.new("RGB", (12, 12), "white").save(image, format="PNG")
     toolbox = Toolbox(tmp_path)
 
     result = toolbox.execute("read", {"path": "pixel.png"})
@@ -310,6 +312,29 @@ def test_read_image_returns_attachment(tmp_path) -> None:
 
     invalid = toolbox.execute("read", {"path": "pixel.png", "offset": 1})
     assert invalid.is_error
+
+
+def test_read_image_detects_mime_without_extension(tmp_path) -> None:
+    path = tmp_path / "payload.dat"
+    Image.new("RGB", (12, 12), "white").save(path, format="PNG")
+
+    result = Toolbox(tmp_path).execute("read", {"path": "payload.dat"})
+    assert not result.is_error
+    assert result.images[0]["mime"] == "image/png"
+    assert result.images[0]["original_mime"] == "image/png"
+
+
+def test_read_bmp_and_large_image_are_normalized(tmp_path) -> None:
+    path = tmp_path / "large.bmp"
+    Image.new("RGB", (3000, 120), "white").save(path, format="BMP")
+
+    result = Toolbox(tmp_path).execute("read", {"path": "large.bmp"})
+    assert not result.is_error
+    info = result.images[0]
+    assert info["mime"] in ("image/png", "image/jpeg")
+    assert info["original_mime"] == "image/bmp"
+    assert info["width"] <= 2048
+    assert info["resized"]
 
 
 def test_image_tool_result_provider_blocks() -> None:
