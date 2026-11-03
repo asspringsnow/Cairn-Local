@@ -189,13 +189,20 @@ class AgentLoop:
                 "is_error": result.is_error,
                 "output": preview,
                 "truncated": len(result.content) > len(preview),
+                "image_count": len(result.images),
             }
         )
 
     def _append_tool_result(self, call: dict[str, Any], result: ToolResult) -> None:
         self._emit_tool_result(call, result)
         self.session.messages.append(
-            tool_message(str(call.get("id") or ""), str(call.get("name") or ""), result.content, is_error=result.is_error)
+            tool_message(
+                str(call.get("id") or ""),
+                str(call.get("name") or ""),
+                result.content,
+                is_error=result.is_error,
+                images=result.images,
+            )
         )
         self._save()
 

@@ -294,3 +294,34 @@ def test_reason_system_prompt_is_graph_only() -> None:
     default_prompt = build_system_prompt("/tmp/ws")
     assert "bootstrap and explore" in default_prompt
     assert "read the graph and the workspace" not in default_prompt
+
+
+def test_read_image_returns_attachment(tmp_path) -> None:
+    image = tmp_path / "pixel.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nnot-a-real-png")
+    toolbox = Toolbox(tmp_path)
+
+    result = toolbox.execute("read", {"path": "pixel.png"})
+    assert not result.is_error
+    assert result.images
+    assert result.images[0]["mime"] == "image/png"
+    assert result.images[0]["data"]
+    assert "Attached as an image content block" in result.content
+
+    invalid = toolbox.execute("read", {"path": "pixel.png", "offset": 1})
+    assert invalid.is_error
+
+
+def test_image_tool_result_provider_blocks() -> None:
+    image = {"mime": "image/png", "data": "aGVsbG8=", "path": "pixel.png", "bytes": 5}
+    message = tool_message("c1", "read", "Image attached", images=[image])
+
+    openai_messages = to_openai([message])
+    assert openai_messages[0]["role"] == "tool"
+    assert openai_messages[1]["role"] == "user"
+    assert any(part.get("type") == "image_url" for part in openai_messages[1]["content"])
+
+    _system, anthropic_messages = to_anthropic([message])
+    tool_result = anthropic_messages[0]["content"][0]
+    assert tool_result["type"] == "tool_result"
+    assert any(part.get("type") == "image" for part in tool_result["content"])

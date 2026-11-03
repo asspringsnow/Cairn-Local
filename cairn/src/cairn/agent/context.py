@@ -33,7 +33,8 @@ def estimate_text_tokens(text: str) -> int:
 
 
 def estimate_message_tokens(message: Message) -> int:
-    return estimate_text_tokens(message_text_for_estimate(message)) + 6
+    image_tokens = len(message.get("images") or []) * 1000
+    return estimate_text_tokens(message_text_for_estimate(message)) + 6 + image_tokens
 
 
 def estimate_messages_tokens(messages: list[Message]) -> int:

@@ -8,6 +8,7 @@ full port scan does not blow up the context window.
 
 from __future__ import annotations
 
+import base64
 import codecs
 import difflib
 import fnmatch
@@ -20,7 +21,7 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -31,6 +32,14 @@ MAX_READ_BYTES = 50 * 1024
 MAX_READ_LINES = 2000
 MAX_GREP_LINE = 500
 MAX_WRITE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_BYTES = 3 * 1024 * 1024
+IMAGE_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".cairn", "venv", "dist", "build"}
 
 
@@ -38,6 +47,7 @@ SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".cairn", "venv", "
 class ToolResult:
     content: str
     is_error: bool = False
+    images: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -290,9 +300,9 @@ class Toolbox:
         return ToolSpec(
             name="read",
             description=(
-                "Read a text file. Returns at most 2000 lines / 50KB per call. "
-                "Use offset (1-indexed) and limit for large files; when output is truncated "
-                "the footer tells you the next offset."
+                "Read a file. Text files return at most 2000 lines / 50KB per call; use offset "
+                "(1-indexed) and limit for large files. Image files (png/jpg/jpeg/gif/webp) are "
+                "returned as image attachments to the model. offset/limit are only for text files."
             ),
             parameters=_obj(
                 {
@@ -315,6 +325,20 @@ class Toolbox:
             return _error(f"file not found: {path}")
         if not path.is_file():
             return _error(f"not a file: {path}")
+
+        mime = IMAGE_MIME_BY_SUFFIX.get(path.suffix.lower())
+        if mime:
+            if args.get("offset") is not None or args.get("limit") is not None:
+                return _error("image read does not support offset/limit")
+            size = path.stat().st_size
+            if size > MAX_IMAGE_BYTES:
+                return _error(f"image is too large ({size} bytes; max {MAX_IMAGE_BYTES})")
+            data = base64.b64encode(path.read_bytes()).decode("ascii")
+            return ToolResult(
+                f"Image: {path} ({mime}, {size} bytes). Attached as an image content block.",
+                images=[{"mime": mime, "data": data, "path": str(path), "bytes": size}],
+            )
+
         offset = _as_int(args.get("offset"), 1, 1, 10_000_000)
         limit = args.get("limit")
         limit = _as_int(limit, MAX_READ_LINES, 1, MAX_READ_LINES) if limit is not None else None

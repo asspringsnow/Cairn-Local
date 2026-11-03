@@ -38,14 +38,24 @@ def assistant_message(content: str, tool_calls: list[ToolCall] | None = None) ->
     return message
 
 
-def tool_message(tool_call_id: str, name: str, content: str, *, is_error: bool = False) -> Message:
-    return {
+def tool_message(
+    tool_call_id: str,
+    name: str,
+    content: str,
+    *,
+    is_error: bool = False,
+    images: list[dict[str, Any]] | None = None,
+) -> Message:
+    message: Message = {
         "role": "tool",
         "tool_call_id": tool_call_id,
         "name": name,
         "content": content,
         "is_error": bool(is_error),
     }
+    if images:
+        message["images"] = images
+    return message
 
 
 def assistant_text(message: Message) -> str:
@@ -59,6 +69,8 @@ def iter_tool_calls(message: Message) -> list[ToolCall]:
 
 def message_text_for_estimate(message: Message) -> str:
     parts = [str(message.get("content") or "")]
+    for _image in message.get("images") or []:
+        parts.append("[image]")
     for call in iter_tool_calls(message):
         parts.append(str(call.get("name") or ""))
         parts.append(json.dumps(call.get("arguments") or {}, ensure_ascii=False, separators=(",", ":")))
@@ -81,8 +93,30 @@ def _openai_tool_calls(calls: list[ToolCall]) -> list[dict[str, Any]]:
 
 def to_openai(messages: list[Message]) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
+    pending_images: list[dict[str, Any]] = []
+    pending_names: set[str] = set()
+
+    def flush_images() -> None:
+        nonlocal pending_images, pending_names
+        if not pending_images:
+            return
+        label = ", ".join(sorted(pending_names)) or "tool"
+        converted.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"Images returned by tool(s): {label}"},
+                    *pending_images,
+                ],
+            }
+        )
+        pending_images = []
+        pending_names = set()
+
     for message in messages:
         role = message.get("role")
+        if role != "tool":
+            flush_images()
         if role == "system":
             converted.append({"role": "system", "content": str(message.get("content") or "")})
         elif role == "user":
@@ -104,6 +138,18 @@ def to_openai(messages: list[Message]) -> list[dict[str, Any]]:
                     "content": str(message.get("content") or ""),
                 }
             )
+            for image in message.get("images") or []:
+                mime = str(image.get("mime") or "")
+                data = str(image.get("data") or "")
+                if mime and data:
+                    pending_images.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{data}"},
+                        }
+                    )
+                    pending_names.add(str(message.get("name") or "tool"))
+    flush_images()
     return converted
 
 
@@ -161,11 +207,22 @@ def to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str, Any]]]:
             continue
 
         if role == "tool":
+            blocks: list[dict[str, Any]] = [{"type": "text", "text": str(message.get("content") or "")}]
+            for image in message.get("images") or []:
+                mime = str(image.get("mime") or "")
+                data = str(image.get("data") or "")
+                if mime and data:
+                    blocks.append(
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": mime, "data": data},
+                        }
+                    )
             pending_tool_results.append(
                 {
                     "type": "tool_result",
                     "tool_use_id": str(message.get("tool_call_id") or ""),
-                    "content": [{"type": "text", "text": str(message.get("content") or "")}],
+                    "content": blocks,
                     "is_error": bool(message.get("is_error")),
                 }
             )

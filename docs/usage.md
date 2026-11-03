@@ -126,6 +126,17 @@ reason 不读项目工作区，也不执行命令。它只根据 graph YAML 做�
 
 execute 和 conclude 复用同一个 session；主阶段超时或输出无法解析时，conclude 仍能基于已有工具结果收尾。
 
+### 图片 read
+
+`read` 除了文本文件，也支持图片：
+
+- png / jpg / jpeg / gif / webp
+- 单张最大 3MB（跨 Anthropic/OpenAI 的安全值；base64 会膨胀）
+- 图片会作为 image content block 附在 tool result 上，不是 base64 文本
+- 需要模型本身支持 vision；纯文本模型可能返回 400，请换 vision 模型或不要读取图片
+- `offset` / `limit` 只适用于文本文件
+- 图片太大时先用 `bash` 压缩/缩放再 `read`
+
 ---
 
 ## 5. 并发与时限

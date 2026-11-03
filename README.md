@@ -34,7 +34,8 @@ Cairn 不再依赖任何外部 agent CLI，也不再需要 Docker：
 内置 agent 的工具集：
 
 - `bash`：在项目工作目录执行命令；大输出落文件，只把尾部返回模型
-- `read` / `write` / `edit`：读写和精确替换文件
+- `read` / `write` / `edit`：读取文本或图片、写入和精确替换文件
+- 图片 `read` 支持 png/jpg/jpeg/gif/webp（最大 3MB），会作为 image content block 送入模型；需要模型支持 vision。`offset`/`limit` 只适用于文本文件。
 - `grep` / `find` / `ls`：搜索文件内容、按 glob 找文件、列目录
 
 上下文接近窗口上限时会自动压缩：保留原始任务和最近的工作，把更早的轮次总结成摘要；完整命令输出始终保存在项目工作区的 `.cairn/outputs/` 下，可随时回读。
