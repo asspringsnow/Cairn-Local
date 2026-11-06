@@ -23,6 +23,7 @@ from cairn.agent.settings import AgentSettings
 class ModelResponse:
     text: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    thinking: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
     raw: dict[str, Any] | None = None
@@ -149,6 +150,8 @@ def parse_openai_sse(lines: Iterable[str]) -> ModelResponse:
 def parse_anthropic_sse(lines: Iterable[str]) -> ModelResponse:
     text_parts: list[str] = []
     tool_parts: dict[int, dict[str, Any]] = {}
+    thinking_blocks: list[dict[str, Any]] = []
+    thinking_by_index: dict[int, dict[str, Any]] = {}
     stop_reason = "end_turn"
     usage: dict[str, int] = {}
     for data in lines:
@@ -165,7 +168,19 @@ def parse_anthropic_sse(lines: Iterable[str]) -> ModelResponse:
         elif event_type == "content_block_start":
             index = int(payload.get("index", 0))
             block = payload.get("content_block") or {}
-            if block.get("type") == "tool_use":
+            if block.get("type") == "thinking":
+                entry = {
+                    "type": "thinking",
+                    "thinking": str(block.get("thinking") or ""),
+                    "signature": str(block.get("signature") or ""),
+                }
+                thinking_blocks.append(entry)
+                thinking_by_index[index] = entry
+            elif block.get("type") == "redacted_thinking":
+                entry = {"type": "redacted_thinking", "data": str(block.get("data") or "")}
+                thinking_blocks.append(entry)
+                thinking_by_index[index] = entry
+            elif block.get("type") == "tool_use":
                 tool_parts[index] = {
                     "id": str(block.get("id") or ""),
                     "name": str(block.get("name") or ""),
@@ -179,6 +194,14 @@ def parse_anthropic_sse(lines: Iterable[str]) -> ModelResponse:
             delta = payload.get("delta") or {}
             if delta.get("type") == "text_delta":
                 text_parts.append(str(delta.get("text") or ""))
+            elif delta.get("type") == "thinking_delta":
+                entry = thinking_by_index.get(index)
+                if entry is not None and entry.get("type") == "thinking":
+                    entry["thinking"] = str(entry.get("thinking") or "") + str(delta.get("thinking") or "")
+            elif delta.get("type") == "signature_delta":
+                entry = thinking_by_index.get(index)
+                if entry is not None and entry.get("type") == "thinking":
+                    entry["signature"] = str(entry.get("signature") or "") + str(delta.get("signature") or "")
             elif delta.get("type") == "input_json_delta":
                 entry = tool_parts.setdefault(index, {"id": "", "name": "", "json": "", "input": None})
                 entry["json"] += str(delta.get("partial_json") or "")
@@ -199,7 +222,13 @@ def parse_anthropic_sse(lines: Iterable[str]) -> ModelResponse:
         raw = entry.get("json") or ""
         argument_value: Any = raw if raw.strip() else (entry.get("input") if entry.get("input") is not None else raw)
         calls.append(_tool_call(index, entry.get("id"), entry.get("name"), argument_value))
-    return ModelResponse(text="".join(text_parts), tool_calls=calls, stop_reason=stop_reason, usage=usage)
+    return ModelResponse(
+        text="".join(text_parts),
+        tool_calls=calls,
+        thinking=thinking_blocks,
+        stop_reason=stop_reason,
+        usage=usage,
+    )
 
 
 class BaseClient:
@@ -287,6 +316,7 @@ class BaseClient:
         timeout: int | None = None,
         retries: int = 4,
         stream: bool = False,
+        thinking: bool | None = None,
     ) -> ModelResponse:
         raise NotImplementedError
 
@@ -384,6 +414,7 @@ class OpenAIClient(BaseClient):
         timeout: int | None = None,
         retries: int = 4,
         stream: bool = False,
+        thinking: bool | None = None,
     ) -> ModelResponse:
         payload = self._payload(messages, tools, max_tokens=max_tokens, temperature=temperature, stream=stream)
         headers = {"Authorization": f"Bearer {self.settings.api_key}", "Content-Type": "application/json"}
@@ -445,15 +476,25 @@ class AnthropicClient(BaseClient):
         max_tokens: int | None,
         temperature: float | None,
         stream: bool,
+        thinking: bool,
     ) -> dict[str, Any]:
         system_text, converted = to_anthropic(messages)
+        max_tokens_value = max_tokens or self.settings.max_tokens
+        thinking_enabled = bool(thinking) and max_tokens_value > 1024
         payload: dict[str, Any] = {
             "model": self.settings.model,
-            "max_tokens": max_tokens or self.settings.max_tokens,
-            "temperature": self.settings.temperature if temperature is None else temperature,
+            "max_tokens": max_tokens_value,
             "messages": converted,
             "stream": stream,
         }
+        if thinking_enabled:
+            # Anthropic's budget-based extended thinking. Keep a margin so the
+            # model still has room for the final answer and tool calls.
+            budget = max(1024, min(8192, max_tokens_value - 1024))
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            # Temperature is incompatible with extended thinking.
+        else:
+            payload["temperature"] = self.settings.temperature if temperature is None else temperature
         if system_text:
             payload["system"] = system_text
         if tools:
@@ -473,36 +514,96 @@ class AnthropicClient(BaseClient):
         timeout: int | None = None,
         retries: int = 4,
         stream: bool = False,
+        thinking: bool | None = None,
     ) -> ModelResponse:
-        payload = self._payload(messages, tools, max_tokens=max_tokens, temperature=temperature, stream=stream)
+        return self._chat(
+            messages,
+            tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout=timeout,
+            retries=retries,
+            stream=stream,
+            thinking=True if thinking is None else bool(thinking),
+        )
+
+    def _chat(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+        *,
+        max_tokens: int | None,
+        temperature: float | None,
+        timeout: int | None,
+        retries: int,
+        stream: bool,
+        thinking: bool,
+    ) -> ModelResponse:
+        payload = self._payload(
+            messages,
+            tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=stream,
+            thinking=thinking,
+        )
         headers = {
             "x-api-key": self.settings.api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
+        if "thinking" in payload:
+            # Needed for interleaved thinking with tool use on Claude 3.7-era
+            # models; Anthropic ignores it for models that don't need it.
+            headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
         url = anthropic_url(self.settings)
         timeout_value = timeout or self.settings.request_timeout
-        if stream:
-            try:
-                response = self._open_stream(url, headers, payload, timeout_value, retries=retries)
+        try:
+            if stream:
                 try:
-                    content_type = response.headers.get("content-type", "").lower()
-                    if "text/event-stream" not in content_type:
-                        # Anthropic-compatible gateways may ignore stream=true
-                        # and return a plain JSON message instead.
-                        try:
-                            return self._parse_non_stream(response.json())
-                        except (ValueError, KeyError, TypeError):
-                            pass
-                    return parse_anthropic_sse(_iter_sse_data(response))
-                finally:
-                    response.close()
-            except (ModelError, requests.RequestException) as exc:
-                if isinstance(exc, ModelError) and (exc.context_overflow or exc.status_code in (401, 403)):
-                    raise
-                payload["stream"] = False
-        request_timeout = max(5, timeout_value // 2) if stream else timeout_value
-        return self._parse_non_stream(self._post(url, headers, payload, request_timeout, retries=retries))
+                    response = self._open_stream(url, headers, payload, timeout_value, retries=retries)
+                    try:
+                        content_type = response.headers.get("content-type", "").lower()
+                        if "text/event-stream" not in content_type:
+                            # Anthropic-compatible gateways may ignore stream=true
+                            # and return a plain JSON message instead.
+                            try:
+                                return self._parse_non_stream(response.json())
+                            except (ValueError, KeyError, TypeError):
+                                pass
+                        return parse_anthropic_sse(_iter_sse_data(response))
+                    finally:
+                        response.close()
+                except (ModelError, requests.RequestException) as exc:
+                    if isinstance(exc, ModelError) and (exc.context_overflow or exc.status_code in (401, 403)):
+                        raise
+                    payload["stream"] = False
+            request_timeout = max(5, timeout_value // 2) if stream else timeout_value
+            return self._parse_non_stream(self._post(url, headers, payload, request_timeout, retries=retries))
+        except ModelError as exc:
+            if (
+                thinking
+                and exc.status_code == 400
+                and ("thinking" in str(exc).lower() or "beta" in str(exc).lower())
+            ):
+                # Older Claude models don't support extended thinking. Retry
+                # once without it, and drop thinking blocks from the transcript
+                # so the fallback request is valid too.
+                stripped = [
+                    {key: value for key, value in message.items() if key != "thinking"}
+                    for message in messages
+                ]
+                return self._chat(
+                    stripped,
+                    tools,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    timeout=timeout,
+                    retries=retries,
+                    stream=stream,
+                    thinking=False,
+                )
+            raise
 
     @staticmethod
     def _parse_non_stream(data: dict[str, Any]) -> ModelResponse:
@@ -511,16 +612,28 @@ class AnthropicClient(BaseClient):
             raise ModelError(f"unexpected Anthropic response: {str(data)[:1000]}")
         texts: list[str] = []
         calls: list[dict[str, Any]] = []
+        thinking: list[dict[str, Any]] = []
         for index, block in enumerate(blocks):
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "text":
                 texts.append(str(block.get("text") or ""))
+            elif block.get("type") == "thinking":
+                thinking.append(
+                    {
+                        "type": "thinking",
+                        "thinking": str(block.get("thinking") or ""),
+                        "signature": str(block.get("signature") or ""),
+                    }
+                )
+            elif block.get("type") == "redacted_thinking":
+                thinking.append({"type": "redacted_thinking", "data": str(block.get("data") or "")})
             elif block.get("type") == "tool_use":
                 calls.append(_tool_call(index, block.get("id"), block.get("name"), block.get("input") or {}))
         return ModelResponse(
             text="\n".join(part for part in texts if part),
             tool_calls=calls,
+            thinking=thinking,
             stop_reason=str(data.get("stop_reason") or "end_turn"),
             usage=_normalize_usage(data.get("usage")),
             raw=data,

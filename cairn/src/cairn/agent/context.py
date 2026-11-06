@@ -133,6 +133,7 @@ def _summarize(client: BaseClient, settings: AgentSettings, messages: list[Messa
             max_tokens=min(4096, settings.max_tokens),
             temperature=0.0,
             timeout=min(settings.request_timeout, 180),
+            thinking=False,
         )
     except Exception:
         return None

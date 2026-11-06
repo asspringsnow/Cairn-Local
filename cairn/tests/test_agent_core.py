@@ -350,3 +350,53 @@ def test_image_tool_result_provider_blocks() -> None:
     tool_result = anthropic_messages[0]["content"][0]
     assert tool_result["type"] == "tool_result"
     assert any(part.get("type") == "image" for part in tool_result["content"])
+
+
+def test_anthropic_thinking_request_and_block_roundtrip() -> None:
+    settings = AgentSettings(
+        provider="anthropic",
+        base_url="https://api.anthropic.com",
+        model="claude-sonnet-4-5",
+        api_key="secret",
+        max_tokens=32768,
+    )
+    client = AnthropicClient(settings)
+    payload = client._payload(
+        [user_message("hello")],
+        [],
+        max_tokens=None,
+        temperature=None,
+        stream=False,
+        thinking=True,
+    )
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 8192}
+    assert "temperature" not in payload
+
+    thinking = [{"type": "thinking", "thinking": "plan", "signature": "sig"}]
+    messages = [
+        assistant_message(
+            "",
+            [{"id": "c1", "name": "bash", "arguments": {"command": "id"}}],
+            thinking=thinking,
+        )
+    ]
+    _system, converted = to_anthropic(messages)
+    blocks = converted[0]["content"]
+    assert blocks[0] == {"type": "thinking", "thinking": "plan", "signature": "sig"}
+    assert blocks[1]["type"] == "tool_use"
+
+
+def test_anthropic_sse_preserves_thinking_and_signature() -> None:
+    lines = [
+        json.dumps({"type": "message_start", "message": {"usage": {"input_tokens": 10, "output_tokens": 0}}}),
+        json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+        json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "plan"}}),
+        json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}}),
+        json.dumps({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+        json.dumps({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "answer"}}),
+        json.dumps({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}),
+        json.dumps({"type": "message_stop"}),
+    ]
+    response = parse_anthropic_sse(lines)
+    assert response.text == "answer"
+    assert response.thinking == [{"type": "thinking", "thinking": "plan", "signature": "sig"}]

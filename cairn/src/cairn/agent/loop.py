@@ -135,11 +135,11 @@ class AgentLoop:
                 self.emit({"type": "assistant", "text": text[:4000]})
 
             if not calls:
-                self.session.messages.append(assistant_message(response.text))
+                self.session.messages.append(assistant_message(response.text, thinking=response.thinking))
                 self._save()
                 return response.text
 
-            self.session.messages.append(assistant_message(response.text, calls))
+            self.session.messages.append(assistant_message(response.text, calls, thinking=response.thinking))
             self._save()
             self._execute_tool_calls(calls, deadline)
 
