@@ -28,6 +28,8 @@ from typing import Any, Callable
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from cairn.agent.graph import load_snapshot, query_graph
+
 
 MAX_OUTPUT_BYTES = 50 * 1024
 MAX_OUTPUT_LINES = 2000
@@ -198,13 +200,19 @@ def _process_image(data: bytes, path: Path, original_mime: str) -> dict[str, Any
 
 
 class Toolbox:
-    def __init__(self, workspace: Path, *, cancel_event: threading.Event | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        cancel_event: threading.Event | None = None,
+        include_graph: bool = False,
+    ):
         self.workspace = workspace.resolve()
         self.output_dir = self.workspace / ".cairn" / "outputs"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.cancel_event = cancel_event or threading.Event()
         self._specs: dict[str, ToolSpec] = {}
-        for spec in (
+        specs = [
             self._bash_spec(),
             self._read_spec(),
             self._write_spec(),
@@ -212,7 +220,10 @@ class Toolbox:
             self._grep_spec(),
             self._find_spec(),
             self._ls_spec(),
-        ):
+        ]
+        if include_graph:
+            specs.append(self._graph_spec())
+        for spec in specs:
             self._specs[spec.name] = spec
 
     def specs(self) -> list[dict[str, Any]]:
@@ -248,6 +259,60 @@ class Toolbox:
             return path.as_posix()
 
     # ------------------------------------------------------------------ bash
+
+    def _graph_spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="graph",
+            description=(
+                "Read-only query over the current project graph. Call overview first, then use "
+                "frontier/get/search/neighbors for details. This tool does not modify the graph."
+            ),
+            parameters=_obj(
+                {
+                    "query": {
+                        "type": "string",
+                        "enum": ["overview", "frontier", "get", "search", "neighbors"],
+                        "description": "Graph query to run.",
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Node id for get/neighbors (e.g. f001, i002, origin, goal).",
+                    },
+                    "text": {"type": "string", "description": "Search text for search."},
+                    "depth": {
+                        "type": "integer",
+                        "description": "Neighbor depth, 1 or 2 (default 1).",
+                        "minimum": 1,
+                        "maximum": 2,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results (default 20, max 50).",
+                        "minimum": 1,
+                        "maximum": 50,
+                    },
+                },
+                ["query"],
+            ),
+            handler=self._graph,
+            parallel_safe=True,
+        )
+
+    def _graph(self, args: dict[str, Any]) -> ToolResult:
+        query = str(args.get("query") or "")
+        try:
+            snapshot = load_snapshot(self.workspace)
+            result = query_graph(
+                snapshot,
+                query,
+                node_id=str(args.get("id") or "") or None,
+                text=str(args.get("text") or "") or None,
+                depth=_as_int(args.get("depth"), 1, 1, 2),
+                limit=_as_int(args.get("limit"), 20, 1, 50),
+            )
+        except ValueError as exc:
+            return _error(str(exc))
+        return ToolResult(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 
     def _bash_spec(self) -> ToolSpec:
         return ToolSpec(

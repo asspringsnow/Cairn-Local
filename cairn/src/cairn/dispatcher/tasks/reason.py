@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
+from cairn.agent.graph import write_snapshot
 from cairn.agent.settings import AgentSettings
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
 from cairn.dispatcher.contracts import parse_json_output, validate_reason_payload
@@ -23,6 +25,39 @@ from cairn.dispatcher.tasks.session import WorkerSession
 from cairn.server.models import ProjectDetail
 
 LOG = logging.getLogger(__name__)
+
+
+def _graph_snapshot(project: ProjectDetail) -> dict[str, Any]:
+    return {
+        "project": {
+            "id": project.project.id,
+            "title": project.project.title,
+            "status": project.project.status,
+        },
+        "facts": [{"id": fact.id, "description": fact.description} for fact in project.facts],
+        "intents": [
+            {
+                "id": intent.id,
+                "from": list(intent.from_),
+                "to": intent.to,
+                "description": intent.description,
+                "creator": intent.creator,
+                "worker": intent.worker,
+                "created_at": intent.created_at,
+                "concluded_at": intent.concluded_at,
+            }
+            for intent in project.intents
+        ],
+        "hints": [
+            {
+                "id": hint.id,
+                "content": hint.content,
+                "creator": hint.creator,
+                "created_at": hint.created_at,
+            }
+            for hint in project.hints
+        ],
+    }
 
 
 def run_reason_task(
@@ -66,13 +101,13 @@ def run_reason_task(
         ]
         allowed_fact_ids = [fact.id for fact in project.facts if fact.id != "goal"]
         graph_yaml = export_yaml.strip()
-        # Keep a debug snapshot for inspection, but inline the graph into the
-        # reason prompt: reason has no tools and must not read the workspace.
+        # Keep a debug YAML snapshot for inspection, but reason only sees the
+        # structured graph through the read-only `graph` tool.
         write_graph_snapshot_reference(session.workspace_path, graph_yaml, phase="reason_execute")
+        write_snapshot(session.workspace_path, _graph_snapshot(project))
         prompt = render_prompt(
             load_prompt(config.runtime.prompt_group, "reason.md"),
             {
-                "graph_yaml": graph_yaml,
                 "fact_ids": format_fact_ids(allowed_fact_ids),
                 "open_intents": format_open_intents(open_intents),
                 "max_intents": str(config.tasks.reason.max_intents),
@@ -80,11 +115,13 @@ def run_reason_task(
         )
 
         execute_started = time.perf_counter()
+        is_native = worker.type == "native"
         result = session.run(
             prompt,
             phase="reason_execute",
             timeout=config.tasks.reason.timeout,
-            tools=False,
+            tools=is_native,
+            allowed_tools={"graph"} if is_native else None,
         )
         execute_ms = int((time.perf_counter() - execute_started) * 1000)
         total_ms = int((time.perf_counter() - task_started) * 1000)

@@ -99,7 +99,7 @@ def main() -> int:
 
     store = SessionStore(session_path)
     session = store.load(system_prompt)
-    toolbox = Toolbox(workspace, cancel_event=_cancel)
+    toolbox = Toolbox(workspace, cancel_event=_cancel, include_graph=phase == "reason")
     client = build_client(settings)
     emit({"type": "ready", "phase": phase, "workspace": str(workspace)})
 

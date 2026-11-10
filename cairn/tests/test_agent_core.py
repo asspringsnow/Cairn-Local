@@ -291,11 +291,111 @@ def test_reason_tool_allowlist_filters_and_rejects(tmp_path) -> None:
 
 def test_reason_system_prompt_is_graph_only() -> None:
     reason_prompt = build_system_prompt("/tmp/ws", phase="reason")
-    assert "Do not call tools" in reason_prompt
-    assert "do not inspect the project workspace" in reason_prompt
+    assert 'graph(query="overview")' in reason_prompt
+    assert "Do not call any other tool" in reason_prompt
+    assert "Do not read files" in reason_prompt
     default_prompt = build_system_prompt("/tmp/ws")
     assert "bootstrap and explore" in default_prompt
     assert "read the graph and the workspace" not in default_prompt
+
+
+def test_graph_tool_queries_structured_snapshot(tmp_path) -> None:
+    snapshot = {
+        "project": {"id": "p1", "title": "demo", "status": "active"},
+        "facts": [
+            {"id": "origin", "description": "start"},
+            {"id": "goal", "description": "find the flag"},
+            {"id": "f001", "description": "SQL injection confirmed on /search"},
+        ],
+        "intents": [
+            {
+                "id": "i001",
+                "from": ["origin"],
+                "to": "f001",
+                "description": "scan the search endpoint",
+                "creator": "cairn",
+                "worker": "cairn",
+                "created_at": "2026-01-01T00:00:00Z",
+                "concluded_at": "2026-01-01T00:01:00Z",
+            }
+        ],
+        "hints": [
+            {
+                "id": "h001",
+                "content": "look at the search form",
+                "creator": "human",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ],
+    }
+    graph_path = tmp_path / ".cairn" / "graph.json"
+    graph_path.parent.mkdir(parents=True)
+    graph_path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    toolbox = Toolbox(tmp_path, include_graph=True)
+    overview = json.loads(toolbox.execute("graph", {"query": "overview"}).content)
+    assert overview["counts"] == {"facts": 3, "intents": 1, "open_intents": 0, "hints": 1}
+    assert overview["goal"] == "find the flag"
+
+    fact = json.loads(toolbox.execute("graph", {"query": "get", "id": "f001"}).content)
+    assert fact["type"] == "fact"
+    assert "SQL injection" in fact["description"]
+    assert fact["incoming_intents"][0]["id"] == "i001"
+
+    search = json.loads(toolbox.execute("graph", {"query": "search", "text": "SQL"}).content)
+    assert search["count"] == 1
+    assert search["results"][0]["id"] == "f001"
+
+    neighbors = json.loads(toolbox.execute("graph", {"query": "neighbors", "id": "f001"}).content)
+    assert "i001" in [intent["id"] for intent in neighbors["intents"]]
+
+
+def test_graph_tool_is_reason_only(tmp_path) -> None:
+    toolbox = Toolbox(tmp_path)
+    result = toolbox.execute("graph", {"query": "overview"})
+    assert result.is_error
+    assert "unknown tool" in result.content
+
+
+def test_graph_tool_bounds_hub_node_queries(tmp_path) -> None:
+    intents = [
+        {
+            "id": f"i{index:03d}",
+            "from": ["origin"],
+            "to": "f001",
+            "description": "branch " * 100,
+            "creator": "cairn",
+            "worker": "cairn",
+            "created_at": "2026-01-01T00:00:00Z",
+            "concluded_at": None,
+        }
+        for index in range(1, 31)
+    ]
+    snapshot = {
+        "project": {"id": "p1", "title": "hub", "status": "active"},
+        "facts": [
+            {"id": "origin", "description": "start"},
+            {"id": "goal", "description": "flag"},
+            {"id": "f001", "description": "target"},
+        ],
+        "intents": intents,
+        "hints": [],
+    }
+    graph_path = tmp_path / ".cairn" / "graph.json"
+    graph_path.parent.mkdir(parents=True)
+    graph_path.write_text(json.dumps(snapshot), encoding="utf-8")
+    toolbox = Toolbox(tmp_path, include_graph=True)
+
+    fact = json.loads(toolbox.execute("graph", {"query": "get", "id": "origin", "limit": 3}).content)
+    assert len(fact["outgoing_intents"]) == 3
+    assert fact["outgoing_truncated"]
+
+    neighbors = json.loads(
+        toolbox.execute("graph", {"query": "neighbors", "id": "origin", "depth": 1, "limit": 3}).content
+    )
+    assert len(neighbors["facts"]) + len(neighbors["intents"]) <= 3
+    assert neighbors["truncated"]
+
 
 
 def test_read_image_returns_attachment(tmp_path) -> None:
